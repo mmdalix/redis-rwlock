@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 import { RwLock, WaitTimeout, BackendUnavailable, LockLost } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 

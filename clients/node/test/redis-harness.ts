@@ -5,7 +5,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Redis from "ioredis";
+import { Redis } from "ioredis";
 
 export interface RedisHarness {
   port: number;

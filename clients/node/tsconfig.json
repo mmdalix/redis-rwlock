@@ -1,15 +1,32 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "ESNext",
-    "moduleResolution": "Bundler",
-    "lib": ["ES2022"],
+    // Target the active Node LTS (Node 24, EOL 2028). Node 22 is the floor (engines).
+    "target": "ES2023",
+    "lib": ["ES2023"],
+
+    // Real Node ESM resolution — relative imports carry explicit .js extensions.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "moduleDetection": "force",
+
+    // Modern library hygiene.
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+
+    // Strictness.
     "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // Emit (type-check only here; tsdown produces the published artifacts).
+    "noEmit": true,
     "declaration": true,
     "sourceMap": true,
     "outDir": "dist",
-    "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
