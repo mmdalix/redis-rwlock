@@ -1,0 +1,14 @@
+{
+  "name": "read-lock-basic",
+  "steps": [
+    { "op": "acquire", "as": "r1", "resource": "rl", "mode": "read", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "acquire", "as": "r2", "resource": "rl", "mode": "read", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "expectFencingGt", "handle": "r2", "than": "r1" },
+    { "op": "acquire", "resource": "rl", "mode": "write", "leaseMs": 30000, "waitMs": 200, "expect": "timeout" },
+    { "op": "release", "handle": "r1" },
+    { "op": "release", "handle": "r2" },
+    { "op": "acquire", "as": "w1", "resource": "rl", "mode": "write", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "expectFencingGt", "handle": "w1", "than": "r2" },
+    { "op": "release", "handle": "w1" }
+  ]
+}

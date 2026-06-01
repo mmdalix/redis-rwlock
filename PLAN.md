@@ -36,8 +36,8 @@ Deferred to M7 (when a 2nd language lands): `clients/` vs top-level layout decis
 | ID | Scope | Status |
 |----|-------|--------|
 | **M0** | Single-node **write lock**: acquire/release, lease, token verify, fencing, `BLPOP` mailbox, fail-closed, server `TIME`. Plus the queue + `cancel_wait` + wait loop needed for a correct timeout/handoff path, and a bounded self-wake for crash recovery. | ✅ in this slice |
-| M1 | **Read locks** + `grant_contiguous_readers` batching + `state` cache + fairness polish. (Reader grant + `write_preferring` already wired; M1 hardens & tests it fully.) | partially wired |
-| M2 | FIFO **queue** + all three `fairness` policies + `cancel_wait` ghost-grant reconciliation. | partially wired |
+| M1 | **Read locks** + `grant_contiguous_readers` batching + `state` cache. Concurrent co-holding, single-release batch grant, stop-at-queued-writer (§6.2), `max_reader_batch` cap, state-cache accuracy — all tested. | ✅ done |
+| M2 | FIFO **queue** + all three `fairness` policies (fifo vs read_preferring distinctions) + `cancel_wait` ghost-grant reconciliation. (`write_preferring` default + ghost-grant wired; M2 hardens fifo/read_preferring.) | partially wired |
 | M3 | `extend` safety margin + opt-in **watchdog** + **scoped API** (`withWriteLock`/`withReadLock`) with `AbortSignal` cancellation. | `extend` done; scoped/watchdog TODO |
 | M4 | **Recovery**: lazy cleanup (done) + self-wake (done) + optional keyspace-event subscriber. | self-wake done |
 | M5 | **Cluster** hash-tagging + **Functions-or-EVALSHA** delivery + capability probe + **version handshake** (`rwlock:__module__`). | EVALSHA done; rest TODO |
