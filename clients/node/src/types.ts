@@ -15,14 +15,10 @@ export interface AcquireOptions {
   fairness?: Fairness;
   /** Cap on readers woken by a single grant. Default 1000. */
   maxReaderBatch?: number;
-}
-
-export interface LockHandle {
-  resource: string;
-  mode: LockMode;
-  token: string;
-  fencingToken: number;
-  leaseUntilMs: number;
+  /** Auto-extend the lease while held (refreshes at ~lease/3). Default false (SPEC §9.3). */
+  watchdog?: boolean;
+  /** Cancel a *pending* acquire. The returned promise rejects with the signal's reason. */
+  signal?: AbortSignal;
 }
 
 /** Tunables for the RwLock instance. All optional; sensible defaults per Spec §19. */
@@ -38,6 +34,8 @@ export interface RwLockConfig {
   requireOwnerId?: boolean;
   /** Max dedicated connections for blocking BLPOP waits (SPEC §15). Default 16. */
   blockingPoolSize?: number;
+  /** Refuse to extend within this margin of expiry (SPEC §9.2). Default 500ms. */
+  extensionMarginMs?: number;
 }
 
 export const DEFAULTS = {
@@ -51,4 +49,5 @@ export const DEFAULTS = {
   requestKeyTtlGraceMs: 60_000,
   requireOwnerId: true,
   blockingPoolSize: 16,
+  extensionMarginMs: 500,
 } as const;

@@ -28,7 +28,11 @@ milestone roadmap and exactly what is and isn't implemented yet.
   cross-language conformance scenarios.
 - `clients/node/` — the Node.js/TypeScript client (wraps `node-redis`).
 
-## Node usage (preview)
+## Node usage
+
+The **scoped API** is the documented front door — it guarantees release, exposes an
+`AbortSignal` that fires the instant the lock is lost, and (with `watchdog`)
+auto-extends long operations:
 
 ```ts
 import { createClient } from "redis";
@@ -37,16 +41,22 @@ import { RwLock } from "@org/redis-rwlock";
 const client = await createClient().connect();
 const rw = new RwLock(client);
 
-const h = await rw.acquireWrite("order:123", { ownerId: "worker-1", leaseMs: 30_000 });
-try {
-  // ... do work; enforce h.fencingToken at your storage layer ...
-} finally {
-  await rw.release(h);
-}
+await rw.withWriteLock("order:123", { ownerId: "worker-1", leaseMs: 30_000, watchdog: true },
+  async (lock) => {
+    // lock.signal aborts the moment the lease is lost — pass it to your work
+    await doWork({ signal: lock.signal });
+    await storage.write(payload, { fencingToken: lock.fencingToken }); // enforce fencing
+  });
+// released automatically, even on throw
 ```
 
-The scoped/closure API (`withWriteLock`, automatic release, watchdog, cancellation)
-is the documented front door and arrives in milestone M3.
+Raw acquire/release for power users, including `await using` for automatic release:
+
+```ts
+await using lock = await rw.acquireWrite("order:123", { ownerId: "worker-1" });
+// ... do work; enforce lock.fencingToken at your storage layer ...
+// released automatically at end of scope
+```
 
 ## Development
 

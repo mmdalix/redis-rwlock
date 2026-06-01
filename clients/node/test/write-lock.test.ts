@@ -130,8 +130,9 @@ describe("M0 write lock", () => {
   it("extend renews a live lock and returns LOST after expiry", async () => {
     const rw = await mk();
     const h = await rw.acquireWrite("r", { ownerId: "w1", leaseMs: 30_000 });
+    const before = h.leaseUntilMs;
     const renewed = await rw.extend(h, 60_000);
-    expect(renewed.leaseUntilMs).toBeGreaterThan(h.leaseUntilMs);
+    expect(renewed.leaseUntilMs).toBeGreaterThan(before);
     await rw.release(renewed);
 
     const h2 = await rw.acquireWrite("r", { ownerId: "w1", leaseMs: 200 });

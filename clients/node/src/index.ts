@@ -1,4 +1,5 @@
-export { RwLock, keyPrefix } from "./rwlock.js";
+export { RwLock, keyPrefix, type LockScope } from "./rwlock.js";
+export { LockHandle, type HandleOwner, type LockHandleData } from "./handle.js";
 export {
   RwLockError,
   WaitTimeoutError,
@@ -12,7 +13,6 @@ export {
   DEFAULTS,
   type AcquireOptions,
   type Fairness,
-  type LockHandle,
   type LockMode,
   type RwLockConfig,
 } from "./types.js";

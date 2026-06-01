@@ -2,7 +2,7 @@
   "compilerOptions": {
     // Target the active Node LTS (Node 24, EOL 2028). Node 22 is the floor (engines).
     "target": "ES2023",
-    "lib": ["ES2023"],
+    "lib": ["ES2023", "ESNext.Disposable"],
 
     // Real Node ESM resolution — relative imports carry explicit .js extensions.
     "module": "nodenext",
