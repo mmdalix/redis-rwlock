@@ -32,7 +32,16 @@ local has_writer     = not is_blank(writer_token)
 
 local grantable = false
 if mode == 'read' then
-  grantable = (not has_writer) and (fairness == 'read_preferring' or queued_writers == 0)
+  -- read_preferring: proceed whenever no writer holds (ignore the queue).
+  -- write_preferring: proceed only if no writer is queued (may pass queued readers).
+  -- fifo: proceed only if nothing is queued ahead (strict order).
+  if fairness == 'read_preferring' then
+    grantable = not has_writer
+  elseif fairness == 'fifo' then
+    grantable = (not has_writer) and queue_len == 0
+  else -- write_preferring
+    grantable = (not has_writer) and queued_writers == 0
+  end
 elseif mode == 'write' then
   -- a writer takes a free lock only when nothing is queued ahead of it
   grantable = (not has_writer) and reader_count == 0 and queue_len == 0

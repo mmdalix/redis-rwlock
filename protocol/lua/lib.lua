@@ -136,9 +136,26 @@ local function grant_one_writer(k, prefix, req_id, now, notify_key_ttl_ms)
   return token
 end
 
+-- Grant a single queued reader (its req hash already exists). Adds it to holders,
+-- writes meta + granted_token, pushes the grant, and removes it from the queue.
+local function grant_one_reader(k, prefix, id, now, notify_key_ttl_ms)
+  local rk = req_key(prefix, id)
+  local owner_id = redis.call('HGET', rk, 'owner_id') or ''
+  local lease_ms = tonumber(redis.call('HGET', rk, 'lease_ms')) or 0
+  local fencing = redis.call('INCR', k.fence)
+  local token = owner_id .. ':' .. id .. ':' .. fencing
+  local expire_at = now + lease_ms
+  redis.call('ZADD', k.holders, expire_at, token)
+  redis.call('HSET', k.holder_meta, token, cjson.encode({
+    mode = 'read', owner_id = owner_id, fencing = fencing, request_id = id }))
+  redis.call('HSET', rk, 'granted_token', token)
+  push_grant(prefix, id, token, fencing, expire_at, 'read', notify_key_ttl_ms)
+  redis.call('ZREM', k.queue, id)
+end
+
 -- Grant consecutive readers from the head of the queue, stopping at the first
 -- queued writer (so a writer is never starved past its position) and after
--- max_reader_batch grants. Returns the number granted.
+-- max_reader_batch grants. Used by write_preferring / fifo. Returns the count.
 local function grant_contiguous_readers(k, prefix, now, notify_key_ttl_ms)
   local count = 0
   while true do
@@ -149,24 +166,36 @@ local function grant_contiguous_readers(k, prefix, now, notify_key_ttl_ms)
     if redis.call('HGET', rk, 'mode') ~= 'read' then break end   -- stop at a queued writer
     local mrb = tonumber(redis.call('HGET', rk, 'max_reader_batch')) or 1000
     if count >= mrb then break end
-    local owner_id = redis.call('HGET', rk, 'owner_id') or ''
-    local lease_ms = tonumber(redis.call('HGET', rk, 'lease_ms')) or 0
-    local fencing = redis.call('INCR', k.fence)
-    local token = owner_id .. ':' .. id .. ':' .. fencing
-    local expire_at = now + lease_ms
-    redis.call('ZADD', k.holders, expire_at, token)
-    redis.call('HSET', k.holder_meta, token, cjson.encode({
-      mode = 'read', owner_id = owner_id, fencing = fencing, request_id = id }))
-    redis.call('HSET', rk, 'granted_token', token)
-    push_grant(prefix, id, token, fencing, expire_at, 'read', notify_key_ttl_ms)
-    redis.call('ZREM', k.queue, id)
+    grant_one_reader(k, prefix, id, now, notify_key_ttl_ms)
     count = count + 1
   end
   if count > 0 then recompute_state_cache(k) end
   return count
 end
 
--- The heart of the system: decide who, if anyone, gets woken next.
+-- Grant every queued reader in FIFO order, SKIPPING over queued writers (so
+-- readers may jump ahead of a waiting writer). Used only by read_preferring,
+-- which maximizes read throughput at the cost of possible writer starvation.
+-- Capped by max_reader_batch to bound script runtime.
+local function grant_readers_anywhere(k, prefix, now, notify_key_ttl_ms)
+  local members = redis.call('ZRANGE', k.queue, 0, -1)   -- ordered snapshot
+  local count = 0
+  for _, id in ipairs(members) do
+    local rk = req_key(prefix, id)
+    if redis.call('HGET', rk, 'mode') == 'read' then
+      local mrb = tonumber(redis.call('HGET', rk, 'max_reader_batch')) or 1000
+      if count >= mrb then break end
+      grant_one_reader(k, prefix, id, now, notify_key_ttl_ms)
+      count = count + 1
+    end
+  end
+  if count > 0 then recompute_state_cache(k) end
+  return count
+end
+
+-- The heart of the system: decide who, if anyone, gets woken next. The governing
+-- fairness policy is the head request's (fairness is expected to be uniform per
+-- resource namespace).
 local function grant_from_queue(k, prefix, now, notify_key_ttl_ms)
   sweep(k, now)
   drop_timed_out_head_requests(k, prefix, now)
@@ -178,20 +207,32 @@ local function grant_from_queue(k, prefix, now, notify_key_ttl_ms)
   if #head == 0 then return 0 end
   local head_id = head[1]
   local head_rk = req_key(prefix, head_id)
-
+  local fairness = redis.call('HGET', head_rk, 'fairness') or 'write_preferring'
   local reader_count = tonumber(redis.call('HGET', k.state, 'reader_count')) or 0
+
   if reader_count > 0 then
-    -- readers currently hold: only let MORE readers in, and only if policy permits
-    -- jumping ahead of any queued writer.
-    local fairness = redis.call('HGET', head_rk, 'fairness') or 'write_preferring'
-    local queued_writers = tonumber(redis.call('HGET', k.state, 'queued_writers')) or 0
-    if fairness == 'read_preferring' or queued_writers == 0 then
-      return grant_contiguous_readers(k, prefix, now, notify_key_ttl_ms)
+    -- readers currently hold: only MORE readers can join.
+    if fairness == 'read_preferring' then
+      return grant_readers_anywhere(k, prefix, now, notify_key_ttl_ms)   -- jump queued writers
     end
-    return 0                                                -- writer queued -> drain readers first
+    -- write_preferring / fifo: only contiguous readers at the head (stops at a
+    -- queued writer, granting nobody and draining the readers first).
+    return grant_contiguous_readers(k, prefix, now, notify_key_ttl_ms)
   end
 
-  -- no holders at all -> serve the head
+  -- no holders at all.
+  if fairness == 'read_preferring' then
+    local granted = grant_readers_anywhere(k, prefix, now, notify_key_ttl_ms)
+    if granted > 0 then return granted end
+    -- no readers queued -> the head must be a writer; serve it.
+    if redis.call('HGET', head_rk, 'mode') == 'write' then
+      grant_one_writer(k, prefix, head_id, now, notify_key_ttl_ms)
+      return 1
+    end
+    return 0
+  end
+
+  -- write_preferring / fifo: serve strictly from the head.
   if redis.call('HGET', head_rk, 'mode') == 'write' then
     grant_one_writer(k, prefix, head_id, now, notify_key_ttl_ms)
     return 1
