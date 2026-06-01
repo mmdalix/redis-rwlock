@@ -1,0 +1,13 @@
+{
+  "name": "fencing-monotonic",
+  "steps": [
+    { "op": "acquire", "as": "a", "resource": "fen", "mode": "write", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "release", "handle": "a" },
+    { "op": "acquire", "as": "b", "resource": "fen", "mode": "write", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "release", "handle": "b" },
+    { "op": "acquire", "as": "c", "resource": "fen", "mode": "write", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "expectFencingGt", "handle": "b", "than": "a" },
+    { "op": "expectFencingGt", "handle": "c", "than": "b" },
+    { "op": "release", "handle": "c" }
+  ]
+}

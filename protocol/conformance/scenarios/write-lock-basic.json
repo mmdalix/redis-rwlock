@@ -1,0 +1,11 @@
+{
+  "name": "write-lock-basic",
+  "steps": [
+    { "op": "acquire", "as": "h1", "resource": "wlb", "mode": "write", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "acquire", "resource": "wlb", "mode": "write", "leaseMs": 30000, "waitMs": 200, "expect": "timeout" },
+    { "op": "release", "handle": "h1" },
+    { "op": "acquire", "as": "h3", "resource": "wlb", "mode": "write", "leaseMs": 30000, "waitMs": 1000, "expect": "granted" },
+    { "op": "expectFencingGt", "handle": "h3", "than": "h1" },
+    { "op": "release", "handle": "h3" }
+  ]
+}
