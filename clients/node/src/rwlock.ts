@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createClientPool, type RedisClientPoolType, type RedisClientType } from "redis";
 import { ScriptRunner } from "./scripts.js";
-import { BackendUnavailable, LockLost, WaitTimeout } from "./errors.js";
+import { BackendUnavailableError, LockLostError, WaitTimeoutError } from "./errors.js";
 import {
   DEFAULTS,
   type AcquireOptions,
@@ -76,13 +76,13 @@ export class RwLock {
           acquireTimeout: this.cfg.maxWaitMs,
         });
         pool.on("error", () => {
-          /* swallow: surfaced per-call as BackendUnavailable */
+          /* swallow: surfaced per-call as BackendUnavailableError */
         });
         await pool.connect();
         this.blockingPool = pool;
       })().catch((err) => {
         this.ready = undefined; // allow a later retry
-        throw new BackendUnavailable("failed to initialise against Redis", { cause: err });
+        throw new BackendUnavailableError("failed to initialise against Redis", { cause: err });
       });
     }
     return this.ready;
@@ -139,7 +139,7 @@ export class RwLock {
         ],
       )) as unknown[];
     } catch (err) {
-      throw new BackendUnavailable(`acquire failed for ${resource}`, { cause: err });
+      throw new BackendUnavailableError(`acquire failed for ${resource}`, { cause: err });
     }
 
     const status = String(res[0]);
@@ -184,7 +184,7 @@ export class RwLock {
         // A dedicated, pooled blocking connection (SPEC §15) — never the user's client.
         popped = await this.blockingPool!.execute((c) => c.blPop(notifyKey, blockMs / 1000));
       } catch (err) {
-        throw new BackendUnavailable(`wait failed for ${resource}`, { cause: err });
+        throw new BackendUnavailableError(`wait failed for ${resource}`, { cause: err });
       }
       if (popped) {
         return this.handleFromPayload(resource, String(popped.element));
@@ -195,7 +195,7 @@ export class RwLock {
       try {
         await this.scripts.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
       } catch (err) {
-        throw new BackendUnavailable(`wait maintenance failed for ${resource}`, { cause: err });
+        throw new BackendUnavailableError(`wait maintenance failed for ${resource}`, { cause: err });
       }
       holderLeaseMs = await this.peekHeadHolderLease(prefix);
     }
@@ -212,7 +212,7 @@ export class RwLock {
     try {
       drained = (await this.client.lPop(notifyKey)) as string | null; // granted at the buzzer?
     } catch (err) {
-      throw new BackendUnavailable(`wait drain failed for ${resource}`, { cause: err });
+      throw new BackendUnavailableError(`wait drain failed for ${resource}`, { cause: err });
     }
     if (drained) {
       return this.handleFromPayload(resource, drained);
@@ -220,9 +220,9 @@ export class RwLock {
     try {
       await this.scripts.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
     } catch (err) {
-      throw new BackendUnavailable(`cancel_wait failed for ${resource}`, { cause: err });
+      throw new BackendUnavailableError(`cancel_wait failed for ${resource}`, { cause: err });
     }
-    throw new WaitTimeout(`acquire timed out for ${resource}`);
+    throw new WaitTimeoutError(`acquire timed out for ${resource}`);
   }
 
   private async peekHeadHolderLease(prefix: string): Promise<number> {
@@ -255,12 +255,12 @@ export class RwLock {
         [handle.token, String(this.cfg.notifyKeyTtlMs)],
       );
     } catch (err) {
-      throw new BackendUnavailable(`release failed for ${handle.resource}`, { cause: err });
+      throw new BackendUnavailableError(`release failed for ${handle.resource}`, { cause: err });
     }
   }
 
   /**
-   * Renew a held lease. Throws LockLost if the lock is no longer ours.
+   * Renew a held lease. Throws LockLostError if the lock is no longer ours.
    * The client-side safety-margin guard (SPEC §9.2) lands with the watchdog in M3.
    */
   async extend(handle: LockHandle, leaseMs?: number): Promise<LockHandle> {
@@ -274,10 +274,10 @@ export class RwLock {
         [handle.token, String(lease)],
       )) as unknown[];
     } catch (err) {
-      throw new BackendUnavailable(`extend failed for ${handle.resource}`, { cause: err });
+      throw new BackendUnavailableError(`extend failed for ${handle.resource}`, { cause: err });
     }
     if (String(res[0]) === "LOST") {
-      throw new LockLost(`lock lost for ${handle.resource}`);
+      throw new LockLostError(`lock lost for ${handle.resource}`);
     }
     return { ...handle, leaseUntilMs: Number(res[1]) };
   }

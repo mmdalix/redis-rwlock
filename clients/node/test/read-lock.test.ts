@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { RwLock, WaitTimeout } from "../src/index.js";
+import { RwLock, WaitTimeoutError } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
 // M1: read locks — concurrent readers, contiguous-reader batching on a single
@@ -221,7 +221,7 @@ describe("M1 read locks", () => {
     // a new reader must NOT jump ahead of the queued writer -> times out
     await expect(
       r2.acquireRead("p", { ownerId: "r2", leaseMs: 30_000, waitMs: 300 }),
-    ).rejects.toBeInstanceOf(WaitTimeout);
+    ).rejects.toBeInstanceOf(WaitTimeoutError);
 
     await r1.release(h1);
     const hw = await writerWait;

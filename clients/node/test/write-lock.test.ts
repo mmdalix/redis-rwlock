@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createClient } from "redis";
-import { RwLock, WaitTimeout, BackendUnavailable, LockLost, type RwLockConfig } from "../src/index.js";
+import { RwLock, WaitTimeoutError, BackendUnavailableError, LockLostError, type RwLockConfig } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
 let harness: RedisHarness;
@@ -50,7 +50,7 @@ describe("M0 write lock", () => {
     const h = await rw.acquireWrite("r", { ownerId: "w1", leaseMs: 30_000 });
     const start = Date.now();
     await expect(rw.acquireWrite("r", { ownerId: "w2", waitMs: 300 })).rejects.toBeInstanceOf(
-      WaitTimeout,
+      WaitTimeoutError,
     );
     const elapsed = Date.now() - start;
     expect(elapsed).toBeGreaterThanOrEqual(250);
@@ -118,12 +118,12 @@ describe("M0 write lock", () => {
     await b.release(h);
   });
 
-  it("fails closed (BackendUnavailable) when Redis is unreachable", async () => {
+  it("fails closed (BackendUnavailableError) when Redis is unreachable", async () => {
     const dead = createClient({ socket: { port: 6390, reconnectStrategy: false } });
     dead.on("error", () => {});
     await dead.connect().catch(() => {}); // connection refused
     const rw = new RwLock(dead, { requireOwnerId: false });
-    await expect(rw.acquireWrite("r", { waitMs: 200 })).rejects.toBeInstanceOf(BackendUnavailable);
+    await expect(rw.acquireWrite("r", { waitMs: 200 })).rejects.toBeInstanceOf(BackendUnavailableError);
     await rw.close().catch(() => {});
   });
 
@@ -136,6 +136,6 @@ describe("M0 write lock", () => {
 
     const h2 = await rw.acquireWrite("r", { ownerId: "w1", leaseMs: 200 });
     await new Promise((r) => setTimeout(r, 300));
-    await expect(rw.extend(h2, 1000)).rejects.toBeInstanceOf(LockLost);
+    await expect(rw.extend(h2, 1000)).rejects.toBeInstanceOf(LockLostError);
   });
 });

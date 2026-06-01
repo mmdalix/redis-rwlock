@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { RwLock, WaitTimeout } from "../src/index.js";
+import { RwLock, WaitTimeoutError } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
 // M2: the genuine fairness-policy distinctions (read_preferring / fifo /
@@ -120,7 +120,7 @@ describe("M2 fairness — fifo & write_preferring (no writer starvation)", () =>
       // a new reader must wait behind the queued writer -> times out
       await expect(
         r2.acquireRead("f", { ownerId: "R2", fairness, leaseMs: 30_000, waitMs: 300 }),
-      ).rejects.toBeInstanceOf(WaitTimeout);
+      ).rejects.toBeInstanceOf(WaitTimeoutError);
 
       // the holding reader releases -> writer is granted (not starved)
       await r1.release(h1);
@@ -153,7 +153,7 @@ describe("M2 ghost-grant race (SPEC §20.5)", () => {
         await other.release(result.h); // taken just in time -> release it
       } else {
         expect(result).toHaveProperty("e");
-        expect((result as { e: unknown }).e).toBeInstanceOf(WaitTimeout);
+        expect((result as { e: unknown }).e).toBeInstanceOf(WaitTimeoutError);
       }
 
       // invariant: either taken-and-released or fully reclaimed — never leaked.

@@ -1,12 +1,12 @@
 export { RwLock, keyPrefix } from "./rwlock.js";
 export {
   RwLockError,
-  WaitTimeout,
-  BackendUnavailable,
-  LockLost,
-  NotHeld,
-  IncompatibleServerLogic,
-  Unsupported,
+  WaitTimeoutError,
+  BackendUnavailableError,
+  LockLostError,
+  NotHeldError,
+  IncompatibleServerLogicError,
+  UnsupportedError,
 } from "./errors.js";
 export {
   DEFAULTS,

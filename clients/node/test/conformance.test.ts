@@ -2,7 +2,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { RwLock, WaitTimeout, type LockHandle } from "../src/index.js";
+import { RwLock, WaitTimeoutError, type LockHandle } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
 // Runs the shared, language-agnostic conformance scenarios (protocol/conformance)
@@ -68,7 +68,7 @@ describe("cross-language conformance scenarios", () => {
             waitMs: step.waitMs,
           });
           if (step.expect === "timeout") {
-            await expect(p).rejects.toBeInstanceOf(WaitTimeout);
+            await expect(p).rejects.toBeInstanceOf(WaitTimeoutError);
           } else {
             const h = await p;
             if (step.as) handles.set(step.as, h);

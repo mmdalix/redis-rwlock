@@ -11,19 +11,19 @@ export class RwLockError extends Error {
 }
 
 /** Could not acquire within waitMs. Not an error condition for many callers. */
-export class WaitTimeout extends RwLockError {}
+export class WaitTimeoutError extends RwLockError {}
 
 /** Redis unreachable / command failed -> fail closed; the acquisition did NOT happen. */
-export class BackendUnavailable extends RwLockError {}
+export class BackendUnavailableError extends RwLockError {}
 
 /** A held lock's lease expired or was taken (extend returned LOST, or watchdog detected it). */
-export class LockLost extends RwLockError {}
+export class LockLostError extends RwLockError {}
 
 /** release/extend on a token not currently held by the caller. */
-export class NotHeld extends RwLockError {}
+export class NotHeldError extends RwLockError {}
 
 /** The installed module's protocol_version is incompatible (Spec §16). */
-export class IncompatibleServerLogic extends RwLockError {}
+export class IncompatibleServerLogicError extends RwLockError {}
 
 /** A required capability is unavailable and no acceptable fallback exists. */
-export class Unsupported extends RwLockError {}
+export class UnsupportedError extends RwLockError {}
