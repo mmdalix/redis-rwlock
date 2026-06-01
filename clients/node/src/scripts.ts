@@ -1,39 +1,46 @@
-// Registers the shared Lua as ioredis custom commands. ioredis transparently uses
-// EVALSHA and falls back to EVAL on NOSCRIPT, which covers M0's delivery path; the
-// FUNCTION-library path and version handshake arrive in a later milestone.
+// Lua delivery for node-redis. Unlike ioredis, node-redis only attaches scripts
+// at createClient() time, but we wrap the user's *existing* client — so we manage
+// EVALSHA + SCRIPT LOAD + NOSCRIPT fallback ourselves. This also gives us the
+// delivery control SPEC §17 calls for (and the seam for the Functions path in M5).
 
-import type { Redis } from "ioredis";
-import { SCRIPTS } from "./lua.generated.js";
+import { SCRIPTS, type ScriptName } from "./lua.generated.js";
 
-// Custom commands attached to the ioredis client. Not part of ioredis's types, so
-// callers reach them through the RwlockRedis cast below.
-export interface RwlockCommands {
-  rwlockAcquire(
-    prefix: string,
-    mode: string,
-    leaseMs: number,
-    waitMs: number,
-    requestId: string,
-    ownerId: string,
-    fairness: string,
-    maxReaderBatch: number,
-    notifyKeyTtlMs: number,
-    requestKeyTtlGraceMs: number,
-  ): Promise<unknown[]>;
-  rwlockRelease(prefix: string, token: string, notifyKeyTtlMs: number): Promise<unknown[]>;
-  rwlockExtend(prefix: string, token: string, leaseMs: number): Promise<unknown[]>;
-  rwlockCancelWait(prefix: string, requestId: string, notifyKeyTtlMs: number): Promise<unknown[]>;
-  rwlockExpireAndGrant(prefix: string, notifyKeyTtlMs: number): Promise<unknown[]>;
+// Structural subset of a node-redis client that we depend on. Any v5/v6 client
+// (RedisClientType) satisfies this; we avoid the heavy generics deliberately.
+export interface RedisLike {
+  evalSha(sha: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;
+  scriptLoad(script: string): Promise<unknown>;
 }
 
-export type RwlockRedis = Redis & RwlockCommands;
+function isNoScript(err: unknown): boolean {
+  return err instanceof Error && err.message.toUpperCase().includes("NOSCRIPT");
+}
 
-export function defineScripts(redis: Redis): void {
-  const r = redis as Redis & { rwlockAcquire?: unknown };
-  if (r.rwlockAcquire) return; // already defined on this connection
-  redis.defineCommand("rwlockAcquire", { numberOfKeys: 1, lua: SCRIPTS.acquire });
-  redis.defineCommand("rwlockRelease", { numberOfKeys: 1, lua: SCRIPTS.release });
-  redis.defineCommand("rwlockExtend", { numberOfKeys: 1, lua: SCRIPTS.extend });
-  redis.defineCommand("rwlockCancelWait", { numberOfKeys: 1, lua: SCRIPTS.cancelWait });
-  redis.defineCommand("rwlockExpireAndGrant", { numberOfKeys: 1, lua: SCRIPTS.expireAndGrant });
+/**
+ * Runs the shared Lua via EVALSHA, loading on first use and transparently
+ * recovering from NOSCRIPT (e.g. after a server SCRIPT FLUSH or restart).
+ */
+export class ScriptRunner {
+  private readonly client: RedisLike;
+  private readonly shas = new Map<ScriptName, string>();
+
+  constructor(client: RedisLike) {
+    this.client = client;
+  }
+
+  private async load(name: ScriptName): Promise<string> {
+    const sha = String(await this.client.scriptLoad(SCRIPTS[name]));
+    this.shas.set(name, sha);
+    return sha;
+  }
+
+  async run(name: ScriptName, keys: string[], args: string[]): Promise<unknown> {
+    const sha = this.shas.get(name) ?? (await this.load(name));
+    try {
+      return await this.client.evalSha(sha, { keys, arguments: args });
+    } catch (err) {
+      if (!isNoScript(err)) throw err;
+      return await this.client.evalSha(await this.load(name), { keys, arguments: args });
+    }
+  }
 }

@@ -1,12 +1,12 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { RwLock, WaitTimeout, type LockHandle } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
 // Runs the shared, language-agnostic conformance scenarios (protocol/conformance)
-// against this client. Every language port must pass the same files (Spec §20.10).
+// against this client. Every language port must pass the same files (SPEC §20.10).
 
 const here = dirname(fileURLToPath(import.meta.url));
 const scenarioDir = resolve(here, "../../../protocol/conformance/scenarios");
@@ -34,6 +34,8 @@ function loadScenarios(): Scenario[] {
 }
 
 let harness: RedisHarness;
+const locks: RwLock[] = [];
+
 beforeAll(async () => {
   harness = await startRedis();
 });
@@ -43,11 +45,16 @@ afterAll(async () => {
 beforeEach(async () => {
   await harness.flush();
 });
+afterEach(async () => {
+  await Promise.all(locks.splice(0).map((l) => l.close().catch(() => {})));
+});
 
 describe("cross-language conformance scenarios", () => {
   for (const scenario of loadScenarios()) {
     it(scenario.name, async () => {
-      const rw = new RwLock(harness.client(), { requireOwnerId: false });
+      const client = await harness.newClient();
+      const rw = new RwLock(client, { requireOwnerId: false });
+      locks.push(rw);
       const handles = new Map<string, LockHandle>();
       let ns = 0;
       const nsResource = (r: string) => `conf:${scenario.name}:${r}`;

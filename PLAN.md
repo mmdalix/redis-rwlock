@@ -1,6 +1,6 @@
 # Implementation Plan — redis-rwlock
 
-**Reference client:** Node.js / TypeScript (wraps `ioredis`). Go/Python follow as ports.
+**Reference client:** Node.js / TypeScript (wraps `node-redis` v5/v6). Go/Python follow as ports.
 
 ## Guiding principle
 
@@ -23,7 +23,7 @@ protocol/
     acquire.lua release.lua extend.lua cancel_wait.lua expire_and_grant.lua
   conformance/
     README.md  scenarios/*.json      # language-agnostic scenarios (Spec §20.10)
-clients/node/                        # ioredis wrapper + generated Lua + tests
+clients/node/                        # node-redis wrapper + generated Lua + tests
   scripts/gen-lua.mjs                # embeds protocol/lua -> src/lua.generated.ts
   src/  test/
 ```

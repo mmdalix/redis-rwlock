@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import type { Redis } from "ioredis";
-import { defineScripts, type RwlockRedis } from "./scripts.js";
+import { createClientPool, type RedisClientPoolType, type RedisClientType } from "redis";
+import { ScriptRunner } from "./scripts.js";
 import { BackendUnavailable, LockLost, WaitTimeout } from "./errors.js";
 import {
   DEFAULTS,
@@ -11,10 +11,14 @@ import {
   type RwLockConfig,
 } from "./types.js";
 
-// Self-wake tuning for the wait loop (Spec §8.2). These bound the BLPOP block so a
+// Self-wake tuning for the wait loop (SPEC §8.2). These bound the BLPOP block so a
 // waiter re-evaluates at a crashed holder's lease boundary without ever busy-spinning.
 const EPSILON_MS = 50; // wake just past a holder's lease boundary
 const FLOOR_MS = 50; // never block for less than this (avoids tight loops / a 0 = infinite BLPOP)
+
+// Accept any node-redis client; users' clients differ in module/script generics.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type RedisClientLike = RedisClientType<any, any, any, any, any>;
 
 /** "rwlock:{<resource>}" — the cluster hash tag keeps every key on one slot. */
 export function keyPrefix(resource: string): string {
@@ -35,7 +39,7 @@ interface GrantPayload {
 }
 
 /**
- * Distributed read/write lock over Redis. Wraps an existing ioredis client; all
+ * Distributed read/write lock over Redis. Wraps an existing node-redis client; all
  * lock decisions live in the shared Lua, so this class is a thin transport layer.
  *
  * M0 scope: raw acquire/release/extend for read & write locks, the BLPOP mailbox
@@ -44,24 +48,38 @@ interface GrantPayload {
  * delivery path, and observability arrive in later milestones.
  */
 export class RwLock {
-  private readonly redis: RwlockRedis;
+  private readonly client: RedisClientLike;
+  private readonly scripts: ScriptRunner;
   private readonly cfg: Required<RwLockConfig>;
   private ready?: Promise<void>;
   private serverTimeOffsetMs = 0;
+  // Dedicated pool for blocking BLPOP waits so we never tie up the user's client (SPEC §15).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private blockingPool?: RedisClientPoolType<any, any, any, any, any>;
 
-  constructor(redis: Redis, config: RwLockConfig = {}) {
-    this.redis = redis as RwlockRedis;
+  constructor(client: RedisClientLike, config: RwLockConfig = {}) {
+    this.client = client;
+    this.scripts = new ScriptRunner(client);
     this.cfg = { ...DEFAULTS, ...config };
   }
 
-  /** Define the scripts and learn the Redis clock offset once, lazily. */
+  /** Connectivity check, clock-offset learning, and blocking-pool setup — once, lazily. */
   private ensureReady(): Promise<void> {
     if (!this.ready) {
       this.ready = (async () => {
-        defineScripts(this.redis);
-        const t = (await this.redis.time()) as unknown as [string, string];
+        const t = (await this.client.sendCommand(["TIME"])) as [string, string];
         const serverMs = Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
         this.serverTimeOffsetMs = serverMs - Date.now();
+
+        const pool = createClientPool(this.client.options, {
+          maximum: this.cfg.blockingPoolSize,
+          acquireTimeout: this.cfg.maxWaitMs,
+        });
+        pool.on("error", () => {
+          /* swallow: surfaced per-call as BackendUnavailable */
+        });
+        await pool.connect();
+        this.blockingPool = pool;
       })().catch((err) => {
         this.ready = undefined; // allow a later retry
         throw new BackendUnavailable("failed to initialise against Redis", { cause: err });
@@ -73,6 +91,20 @@ export class RwLock {
   /** Best-effort estimate of the Redis server clock; used only to size timeouts. */
   private serverNow(): number {
     return Date.now() + this.serverTimeOffsetMs;
+  }
+
+  /** Release the blocking pool. Does NOT touch the user's client. */
+  async close(): Promise<void> {
+    const pool = this.blockingPool;
+    this.blockingPool = undefined;
+    this.ready = undefined;
+    if (pool) {
+      try {
+        await pool.close();
+      } catch {
+        /* already closed */
+      }
+    }
   }
 
   acquireWrite(resource: string, opts: AcquireOptions = {}): Promise<LockHandle> {
@@ -91,18 +123,21 @@ export class RwLock {
 
     let res: unknown[];
     try {
-      res = await this.redis.rwlockAcquire(
-        prefix,
-        mode,
-        o.leaseMs,
-        o.waitMs,
-        requestId,
-        o.ownerId,
-        o.fairness,
-        o.maxReaderBatch,
-        this.cfg.notifyKeyTtlMs,
-        this.cfg.requestKeyTtlGraceMs,
-      );
+      res = (await this.scripts.run(
+        "acquire",
+        [prefix],
+        [
+          mode,
+          String(o.leaseMs),
+          String(o.waitMs),
+          requestId,
+          o.ownerId,
+          o.fairness,
+          String(o.maxReaderBatch),
+          String(this.cfg.notifyKeyTtlMs),
+          String(this.cfg.requestKeyTtlGraceMs),
+        ],
+      )) as unknown[];
     } catch (err) {
       throw new BackendUnavailable(`acquire failed for ${resource}`, { cause: err });
     }
@@ -133,47 +168,40 @@ export class RwLock {
     waitDeadlineMs: number,
     headHolderLeaseMs: number,
   ): Promise<LockHandle> {
-    // A dedicated blocking connection so a BLPOP never ties up the user's pool
-    // (Spec §15). M0 uses one connection per wait; pooling/backpressure is M6.
-    const bconn = this.redis.duplicate();
     let holderLeaseMs = headHolderLeaseMs;
-    try {
-      for (;;) {
-        const remaining = waitDeadlineMs - this.serverNow();
-        if (remaining <= 0) {
-          return await this.finishTimeout(resource, prefix, requestId, notifyKey);
-        }
-
-        // Block until the holder's lease boundary (to catch a crash) or the deadline.
-        const boundary =
-          holderLeaseMs > 0 ? holderLeaseMs - this.serverNow() + EPSILON_MS : remaining;
-        const blockMs = Math.max(FLOOR_MS, Math.min(remaining, Math.max(boundary, 0) || remaining));
-
-        let popped: [string, string] | null;
-        try {
-          popped = await bconn.blpop(notifyKey, blockMs / 1000);
-        } catch (err) {
-          throw new BackendUnavailable(`wait failed for ${resource}`, { cause: err });
-        }
-        if (popped) {
-          return this.handleFromPayload(resource, popped[1]);
-        }
-
-        // Woke with no grant -> the holder may have crashed. Run maintenance once
-        // (which may push a grant into our mailbox), refresh the boundary, re-block.
-        try {
-          await this.redis.rwlockExpireAndGrant(prefix, this.cfg.notifyKeyTtlMs);
-        } catch (err) {
-          throw new BackendUnavailable(`wait maintenance failed for ${resource}`, { cause: err });
-        }
-        holderLeaseMs = await this.peekHeadHolderLease(prefix);
+    for (;;) {
+      const remaining = waitDeadlineMs - this.serverNow();
+      if (remaining <= 0) {
+        return this.finishTimeout(resource, prefix, requestId, notifyKey);
       }
-    } finally {
-      bconn.disconnect();
+
+      // Block until the holder's lease boundary (to catch a crash) or the deadline.
+      const boundary = holderLeaseMs > 0 ? holderLeaseMs - this.serverNow() + EPSILON_MS : remaining;
+      const blockMs = Math.max(FLOOR_MS, Math.min(remaining, Math.max(boundary, 0) || remaining));
+
+      let popped: { key: unknown; element: unknown } | null;
+      try {
+        // A dedicated, pooled blocking connection (SPEC §15) — never the user's client.
+        popped = await this.blockingPool!.execute((c) => c.blPop(notifyKey, blockMs / 1000));
+      } catch (err) {
+        throw new BackendUnavailable(`wait failed for ${resource}`, { cause: err });
+      }
+      if (popped) {
+        return this.handleFromPayload(resource, String(popped.element));
+      }
+
+      // Woke with no grant -> the holder may have crashed. Run maintenance once
+      // (which may push a grant into our mailbox), refresh the boundary, re-block.
+      try {
+        await this.scripts.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
+      } catch (err) {
+        throw new BackendUnavailable(`wait maintenance failed for ${resource}`, { cause: err });
+      }
+      holderLeaseMs = await this.peekHeadHolderLease(prefix);
     }
   }
 
-  /** Last-instant reconciliation when the wait deadline elapses (Spec §8.4). */
+  /** Last-instant reconciliation when the wait deadline elapses (SPEC §8.4). */
   private async finishTimeout(
     resource: string,
     prefix: string,
@@ -182,7 +210,7 @@ export class RwLock {
   ): Promise<LockHandle> {
     let drained: string | null;
     try {
-      drained = await this.redis.lpop(notifyKey); // were we granted at the buzzer?
+      drained = (await this.client.lPop(notifyKey)) as string | null; // granted at the buzzer?
     } catch (err) {
       throw new BackendUnavailable(`wait drain failed for ${resource}`, { cause: err });
     }
@@ -190,7 +218,7 @@ export class RwLock {
       return this.handleFromPayload(resource, drained);
     }
     try {
-      await this.redis.rwlockCancelWait(prefix, requestId, this.cfg.notifyKeyTtlMs);
+      await this.scripts.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
     } catch (err) {
       throw new BackendUnavailable(`cancel_wait failed for ${resource}`, { cause: err });
     }
@@ -199,8 +227,8 @@ export class RwLock {
 
   private async peekHeadHolderLease(prefix: string): Promise<number> {
     try {
-      const r = (await this.redis.zrange(`${prefix}:holders`, 0, 0, "WITHSCORES")) as string[];
-      return r.length >= 2 ? Number(r[1]) : -1;
+      const r = await this.client.zRangeWithScores(`${prefix}:holders`, 0, 0);
+      return r.length > 0 ? Number(r[0]!.score) : -1;
     } catch {
       return -1; // a transient read failure just means we re-block for the remaining time
     }
@@ -221,7 +249,11 @@ export class RwLock {
   async release(handle: LockHandle): Promise<void> {
     await this.ensureReady();
     try {
-      await this.redis.rwlockRelease(keyPrefix(handle.resource), handle.token, this.cfg.notifyKeyTtlMs);
+      await this.scripts.run(
+        "release",
+        [keyPrefix(handle.resource)],
+        [handle.token, String(this.cfg.notifyKeyTtlMs)],
+      );
     } catch (err) {
       throw new BackendUnavailable(`release failed for ${handle.resource}`, { cause: err });
     }
@@ -229,14 +261,18 @@ export class RwLock {
 
   /**
    * Renew a held lease. Throws LockLost if the lock is no longer ours.
-   * The client-side safety-margin guard (Spec §9.2) lands with the watchdog in M3.
+   * The client-side safety-margin guard (SPEC §9.2) lands with the watchdog in M3.
    */
   async extend(handle: LockHandle, leaseMs?: number): Promise<LockHandle> {
     await this.ensureReady();
     const lease = this.clampLease(leaseMs ?? this.cfg.defaultLeaseMs);
     let res: unknown[];
     try {
-      res = await this.redis.rwlockExtend(keyPrefix(handle.resource), handle.token, lease);
+      res = (await this.scripts.run(
+        "extend",
+        [keyPrefix(handle.resource)],
+        [handle.token, String(lease)],
+      )) as unknown[];
     } catch (err) {
       throw new BackendUnavailable(`extend failed for ${handle.resource}`, { cause: err });
     }

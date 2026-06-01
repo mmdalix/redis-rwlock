@@ -37,11 +37,11 @@
     "test:watch": "vitest"
   },
   "peerDependencies": {
-    "ioredis": "^5"
+    "redis": "^5 || ^6"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
-    "ioredis": "^5.11.0",
+    "redis": "^6.0.0",
     "tsdown": "^0.22.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.8"

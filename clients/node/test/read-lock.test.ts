@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { RwLock, WaitTimeout } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
@@ -6,6 +6,8 @@ import { startRedis, type RedisHarness } from "./redis-harness.js";
 // already wired through grant_from_queue (readers co-hold; reader/writer exclude).
 
 let harness: RedisHarness;
+const locks: RwLock[] = [];
+
 beforeAll(async () => {
   harness = await startRedis();
 });
@@ -15,12 +17,20 @@ afterAll(async () => {
 beforeEach(async () => {
   await harness.flush();
 });
+afterEach(async () => {
+  await Promise.all(locks.splice(0).map((l) => l.close().catch(() => {})));
+});
 
-const mk = () => new RwLock(harness.client());
+async function mk(): Promise<RwLock> {
+  const client = await harness.newClient();
+  const rw = new RwLock(client);
+  locks.push(rw);
+  return rw;
+}
 
 describe("read lock (M1 preview)", () => {
   it("lets multiple readers hold concurrently", async () => {
-    const rw = mk();
+    const rw = await mk();
     const a = await rw.acquireRead("r", { ownerId: "r1", leaseMs: 30_000 });
     const b = await rw.acquireRead("r", { ownerId: "r2", leaseMs: 30_000 });
     expect(a.mode).toBe("read");
@@ -31,8 +41,8 @@ describe("read lock (M1 preview)", () => {
   });
 
   it("blocks a reader while a writer holds, then grants it on release", async () => {
-    const w = mk();
-    const r = mk();
+    const w = await mk();
+    const r = await mk();
     const hw = await w.acquireWrite("r", { ownerId: "w1", leaseMs: 30_000 });
     const waiter = r.acquireRead("r", { ownerId: "r1", leaseMs: 30_000, waitMs: 5000 });
     await new Promise((res) => setTimeout(res, 150));
@@ -43,9 +53,9 @@ describe("read lock (M1 preview)", () => {
   });
 
   it("write_preferring: a queued writer blocks new readers from jumping ahead", async () => {
-    const r1 = mk();
-    const wr = mk();
-    const r2 = mk();
+    const r1 = await mk();
+    const wr = await mk();
+    const r2 = await mk();
     // r1 holds a read lock
     const h1 = await r1.acquireRead("r", { ownerId: "r1", leaseMs: 30_000 });
     // a writer queues behind it

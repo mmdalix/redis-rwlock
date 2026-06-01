@@ -5,11 +5,15 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Redis } from "ioredis";
+import { createClient, type RedisClientType } from "redis";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Client = RedisClientType<any, any, any, any, any>;
 
 export interface RedisHarness {
-  port: number;
-  client: () => Redis;
+  url: string;
+  /** A fresh, connected node-redis client (tracked for teardown). */
+  newClient: () => Promise<Client>;
   flush: () => Promise<void>;
   stop: () => Promise<void>;
 }
@@ -18,25 +22,27 @@ function randomPort(): number {
   return 20000 + Math.floor(Math.random() * 20000);
 }
 
-async function waitForReady(port: number, timeoutMs = 10000): Promise<void> {
+async function waitForReady(url: string, timeoutMs = 10000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const probe = new Redis({ port, lazyConnect: true, maxRetriesPerRequest: 1 });
+    const probe = createClient({ url });
+    probe.on("error", () => {});
     try {
       await probe.connect();
       const pong = await probe.ping();
-      probe.disconnect();
+      await probe.close();
       if (pong === "PONG") return;
     } catch {
-      probe.disconnect();
+      probe.destroy?.();
     }
-    if (Date.now() > deadline) throw new Error(`redis-server on :${port} did not become ready`);
+    if (Date.now() > deadline) throw new Error(`redis-server at ${url} did not become ready`);
     await new Promise((r) => setTimeout(r, 100));
   }
 }
 
 export async function startRedis(): Promise<RedisHarness> {
   const port = randomPort();
+  const url = `redis://127.0.0.1:${port}`;
   const dir = mkdtempSync(join(tmpdir(), "rwlock-redis-"));
   const proc: ChildProcess = spawn(
     "redis-server",
@@ -47,25 +53,26 @@ export async function startRedis(): Promise<RedisHarness> {
     throw new Error(`failed to spawn redis-server: ${e.message}`);
   });
 
-  await waitForReady(port);
+  await waitForReady(url);
 
-  const clients: Redis[] = [];
-  const client = () => {
-    const c = new Redis({ port, maxRetriesPerRequest: 2 });
+  const clients: Client[] = [];
+  const newClient = async (): Promise<Client> => {
+    const c = createClient({ url }) as Client;
+    c.on("error", () => {});
+    await c.connect();
     clients.push(c);
     return c;
   };
 
   return {
-    port,
-    client,
+    url,
+    newClient,
     flush: async () => {
-      const c = client();
-      await c.flushall();
-      c.disconnect();
+      const c = await newClient();
+      await c.flushAll();
     },
     stop: async () => {
-      for (const c of clients) c.disconnect();
+      await Promise.all(clients.map((c) => c.close().catch(() => c.destroy?.())));
       proc.kill("SIGKILL");
       await new Promise((r) => setTimeout(r, 100));
       rmSync(dir, { recursive: true, force: true });

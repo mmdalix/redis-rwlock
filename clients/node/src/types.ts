@@ -36,6 +36,8 @@ export interface RwLockConfig {
   notifyKeyTtlMs?: number;
   requestKeyTtlGraceMs?: number;
   requireOwnerId?: boolean;
+  /** Max dedicated connections for blocking BLPOP waits (SPEC §15). Default 16. */
+  blockingPoolSize?: number;
 }
 
 export const DEFAULTS = {
@@ -48,4 +50,5 @@ export const DEFAULTS = {
   notifyKeyTtlMs: 60_000,
   requestKeyTtlGraceMs: 60_000,
   requireOwnerId: true,
+  blockingPoolSize: 16,
 } as const;

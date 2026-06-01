@@ -26,15 +26,16 @@ milestone roadmap and exactly what is and isn't implemented yet.
 
 - `protocol/` — language-agnostic source of truth: the Lua scripts and the
   cross-language conformance scenarios.
-- `clients/node/` — the Node.js/TypeScript client (wraps `ioredis`).
+- `clients/node/` — the Node.js/TypeScript client (wraps `node-redis`).
 
 ## Node usage (preview)
 
 ```ts
-import Redis from "ioredis";
+import { createClient } from "redis";
 import { RwLock } from "@org/redis-rwlock";
 
-const rw = new RwLock(new Redis());
+const client = await createClient().connect();
+const rw = new RwLock(client);
 
 const h = await rw.acquireWrite("order:123", { ownerId: "worker-1", leaseMs: 30_000 });
 try {
