@@ -160,8 +160,7 @@ describe("M6 metrics", () => {
     // and the server itself reports LOST).
     const h2 = await rw.acquireWrite("m3b", { ownerId: "w1", leaseMs: 30_000 });
     const admin = await harness.newClient();
-    await admin.del(`rwlock:{m3b}:holders`);
-    await admin.del(`rwlock:{m3b}:holder_meta`);
+    await admin.del(`rwlock:{m3b}:writer`); // evict the writer out from under us
     await expect(rw.extend(h2, 60_000)).rejects.toThrow();
     expect(metrics.count("rwlock_extend_total", ["result", "lost"])).toBe(1);
     expect(metrics.count("rwlock_lock_lost_total")).toBe(1);

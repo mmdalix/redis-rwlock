@@ -9,7 +9,9 @@ const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function holderCount(h: RedisHarness, r: string): Promise<number> {
   const c = await h.newClient();
-  return Number(await c.zCard(`rwlock:{${r}}:holders`));
+  const readers = Number(await c.zCard(`rwlock:{${r}}:readers`));
+  const writer = Number(await c.exists(`rwlock:{${r}}:writer`));
+  return readers + writer;
 }
 
 describe("M4 keyspace subscriber (events ENABLED)", () => {
@@ -95,13 +97,15 @@ describe("M4 keyspace subscriber (events DISABLED)", () => {
     expect(rw.keyspaceActive).toBe(false);
   });
 
-  it("does NOT proactively reclaim (a crashed holder lingers until the next op)", async () => {
+  it("a crashed reader lingers until the next op reclaims it via lazy cleanup", async () => {
     const rw = await mk();
-    await rw.acquireWrite("orphan", { ownerId: "w1", leaseMs: 300 }); // crash, no waiter
+    // A crashed READER lives in a ZSET with no native TTL, so without events or any
+    // other op it lingers past its lease. (A crashed WRITER, by contrast, self-expires
+    // via its key TTL — a v2 improvement, exercised by the events-enabled suite.)
+    await rw.acquireRead("orphan", { ownerId: "r1", leaseMs: 300 });
     await settle(900);
-    // without events, nothing swept it; the stale ZSET member remains until a later op
     expect(await holderCount(harness, "orphan")).toBe(1);
-    // ...and the next acquirer reclaims it via lazy cleanup
+    // the next acquirer sweeps the expired reader and is granted
     const h = await rw.acquireWrite("orphan", { ownerId: "w2", waitMs: 1000 });
     expect(h.token).toContain("w2");
     await rw.release(h);
@@ -112,12 +116,12 @@ describe("M4 keyspace subscriber (events DISABLED)", () => {
     const admin = await harness.newClient();
     const p = "rwlock:{phantom}";
     // Simulate the post-crash state: a queued writer whose req hash has TTL-expired,
-    // leaving an orphan queue entry and an inflated queued_writers counter.
+    // leaving an orphan queue entry. (v2 derives queued_writers from live req hashes,
+    // so there is no separate counter to inflate — the orphan itself is the hazard.)
     await admin.zAdd(`${p}:queue`, { score: 1, value: "ghost-writer-req" });
-    await admin.hSet(`${p}:state`, { queued_writers: "1", mode: "none" });
 
-    // Before the fix, the reader's fast path saw queued_writers=1, queued, and timed
-    // out forever. After the fix, prune_queue drops the orphan and recomputes it to 0.
+    // prune_queue must drop the orphan and derive queued_writers=0, so the reader is
+    // granted immediately instead of being wedged behind a phantom writer.
     const h = await rw.acquireRead("phantom", { ownerId: "r1", leaseMs: 30_000, waitMs: 1000 });
     expect(h.mode).toBe("read");
     expect((await rw.inspect("phantom")).queuedWriters).toBe(0);

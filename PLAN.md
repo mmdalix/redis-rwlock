@@ -6,7 +6,15 @@
 
 The Lua scripts in `protocol/lua/` are the product; clients are thin wrappers
 (Spec §0, §3). We build a **thin vertical slice** — Lua + the Node client + a
-shared conformance harness — and grow it milestone by milestone. We deliberately
+shared conformance harness — and grow it milestone by milestone.
+
+> **Protocol v2 (current).** After a spec + code review, the protocol was cleanly
+> rewritten to derive all state from source-of-truth structures (separate `readers`
+> ZSET + a TTL'd `writer` key) instead of a denormalized cache — eliminating the
+> `queued_writers`-drift and orphan bug classes by construction, giving crashed
+> writers native key-TTL recovery, and removing per-holder metadata and the
+> `lease_expiry` sentinel. `PROTOCOL_VERSION` is **2**; SPEC.md and Appendix A were
+> reconciled to match. See `COMPATIBILITY.md`. We deliberately
 do **not** scaffold the full polyglot tree, the `sync-lua`/`check-sync` tooling, or
 the CI interop matrix until a second language actually exists (milestone M7); until
 then they are empty cost.

@@ -330,8 +330,8 @@ export class RwLock {
     // QUEUED -> block on the private mailbox.
     const notifyKey = String(res[2]);
     const waitDeadlineMs = Number(res[3]);
-    const headHolderLeaseMs = Number(res[4]);
-    return this.waitForGrant(resource, prefix, requestId, notifyKey, waitDeadlineMs, headHolderLeaseMs, o);
+    const nextWakeMs = Number(res[4]);
+    return this.waitForGrant(resource, prefix, requestId, notifyKey, waitDeadlineMs, nextWakeMs, o);
   }
 
   /** Read-only debug snapshot of a resource (SPEC §18). */
@@ -363,10 +363,9 @@ export class RwLock {
     requestId: string,
     notifyKey: string,
     waitDeadlineMs: number,
-    headHolderLeaseMs: number,
+    nextWakeMs: number,
     o: ResolvedOptions,
   ): Promise<LockHandle> {
-    let holderLeaseMs = headHolderLeaseMs;
     for (;;) {
       if (o.signal?.aborted) {
         await this.abortPending(prefix, requestId);
@@ -377,9 +376,10 @@ export class RwLock {
         return this.finishTimeout(resource, prefix, requestId, notifyKey, o);
       }
 
-      // Block until the holder's lease boundary (to catch a crash) or the deadline,
-      // re-checking a cancel signal at least every SIGNAL_POLL_MS.
-      const boundary = holderLeaseMs > 0 ? holderLeaseMs - this.serverNow() + EPSILON_MS : remaining;
+      // Block until the soonest interesting event (a holder lease boundary or the head
+      // request's deadline — to catch a crash) or our own deadline, re-checking a cancel
+      // signal at least every SIGNAL_POLL_MS.
+      const boundary = nextWakeMs > 0 ? nextWakeMs - this.serverNow() + EPSILON_MS : remaining;
       let blockMs = Math.max(FLOOR_MS, Math.min(remaining, Math.max(boundary, 0) || remaining));
       if (o.signal) blockMs = Math.min(blockMs, SIGNAL_POLL_MS);
 
@@ -399,14 +399,16 @@ export class RwLock {
         return this.handleFromPayload(resource, String(popped.element), o);
       }
 
-      // Woke with no grant -> the holder may have crashed. Run maintenance once
-      // (which may push a grant into our mailbox), refresh the boundary, re-block.
+      // Woke with no grant -> a holder may have crashed. Run maintenance once (which may
+      // push a grant into our mailbox), and refresh the self-wake boundary from its return.
       try {
-        await this.del.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
+        const r2 = (await this.del.run("expireAndGrant", [prefix], [
+          String(this.cfg.notifyKeyTtlMs),
+        ])) as unknown[];
+        nextWakeMs = Number(r2[2]);
       } catch (err) {
         throw new BackendUnavailableError(`wait maintenance failed for ${resource}`, { cause: err });
       }
-      holderLeaseMs = await this.peekHeadHolderLease(prefix);
     }
   }
 
@@ -437,15 +439,6 @@ export class RwLock {
       await this.del.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
     } catch (err) {
       throw new BackendUnavailableError(`cancel_wait failed`, { cause: err });
-    }
-  }
-
-  private async peekHeadHolderLease(prefix: string): Promise<number> {
-    try {
-      const r = await this.client.zRangeWithScores(`${prefix}:holders`, 0, 0);
-      return r.length > 0 ? Number(r[0]!.score) : -1;
-    } catch {
-      return -1; // a transient read failure just means we re-block for the remaining time
     }
   }
 

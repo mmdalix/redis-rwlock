@@ -4,7 +4,7 @@ import { keyPrefix } from "../src/index.js";
 // M5: Redis Cluster safety. A Lua/Function call may only touch keys in ONE slot, so
 // every key for a resource must share a slot. We enforce that with the {r} hash tag
 // (SPEC §4); here we prove it by computing the actual cluster slot in JS and anchoring
-// it to the value Redis itself reports (CLUSTER KEYSLOT 'rwlock:{order:9}:holders' = 14638).
+// it to the value Redis itself reports (CLUSTER KEYSLOT 'rwlock:{order:9}:readers' = 14638).
 
 // CRC16/XMODEM, the function Redis Cluster uses for slot assignment.
 function crc16(s: string): number {
@@ -31,13 +31,11 @@ function slotOf(key: string): number {
 function allResourceKeys(resource: string): string[] {
   const p = keyPrefix(resource);
   return [
-    `${p}:state`,
-    `${p}:holders`,
-    `${p}:holder_meta`,
+    `${p}:readers`,
+    `${p}:writer`,
     `${p}:queue`,
     `${p}:seq`,
     `${p}:fence`,
-    `${p}:lease_expiry`,
     `${p}:req:01J9ZsampleID`,
     `${p}:notify:01J9ZsampleID`,
   ];
@@ -45,8 +43,8 @@ function allResourceKeys(resource: string): string[] {
 
 describe("M5 cluster hash-tag co-location", () => {
   it("computes the same slot Redis does for a tagged key", () => {
-    // anchor: redis-cli CLUSTER KEYSLOT 'rwlock:{order:9}:holders' -> 14638
-    expect(slotOf("rwlock:{order:9}:holders")).toBe(14638);
+    // anchor: redis-cli CLUSTER KEYSLOT 'rwlock:{order:9}:readers' -> 14638
+    expect(slotOf("rwlock:{order:9}:readers")).toBe(14638);
   });
 
   it("places every key of a resource on a single slot", () => {

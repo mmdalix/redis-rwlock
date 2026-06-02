@@ -1,7 +1,7 @@
 # Distributed Read/Write Lock over Redis — Implementation Specification
 
 **Status:** Ready for implementation
-**Version:** Spec v1.0 · targets wire/protocol `PROTOCOL_VERSION = 1`
+**Version:** Spec v2.0 · targets wire/protocol `PROTOCOL_VERSION = 2`
 **Audience:** Engineers (or coding agents) building the library in Node.js, Python, Go, Java, etc.
 **Deliverable being specified:** a *client library*, published to npm / PyPI / Go modules / Maven, that talks to a Redis the **user already runs**. No server, daemon, or sidecar that we operate. It must work the moment a user installs it and points it at their Redis.
 
@@ -93,7 +93,7 @@ Therefore the library MUST:
 - At most one writer holds a resource at any time.
 - Readers hold only when no writer holds.
 - A writer holds only when no readers hold.
-- Wait order is FIFO, with contiguous readers batch-granted together.
+- Wait order is FIFO for *queued* waiters, with contiguous readers batch-granted together. (Under the default `write_preferring`, a fresh reader may be granted immediately while no writer is queued rather than queuing — strict head-of-line FIFO for new readers requires the `fifo` policy; see §11.)
 - Releasing a lock wakes eligible waiters immediately.
 - Waiters do not poll.
 
@@ -133,15 +133,16 @@ State this verbatim in the README:
 
 All keys for one resource share the hash tag `{<resource>}` so that, in Redis Cluster, every key a script touches lives on one slot. **This is mandatory** — a Lua/Function call may only touch keys in one slot.
 
+**Key-passing convention (mandatory, all ports):** every script/function receives **exactly one key** in `KEYS[1]` — the resource *prefix* `rwlock:{<resource>}` — and derives all other keys from it by suffix (`:readers`, `:writer`, …) inside the script. Do **not** pass the individual keys in `KEYS`; the parameters after the prefix are `ARGV` (Section 7). This is safe in Cluster because every derived key shares the `{<resource>}` hash tag. The resource name MUST NOT contain `{` or `}`.
+
 Let `r` = the user-supplied resource name (e.g. `order:123`). The keys are:
 
 ```
-rwlock:{r}:state          HASH    lock state (see 4.1)
-rwlock:{r}:holders        ZSET    member = token,      score = expire_at_ms   (readers AND writer)
-rwlock:{r}:holder_meta    HASH    token -> json (see 4.3)
-rwlock:{r}:queue          ZSET    member = request_id, score = seq            (FIFO; O(log N) cancel)
-rwlock:{r}:req:{id}       HASH    one per waiting request (see 4.5)  (+ TTL)
-rwlock:{r}:notify:{id}    LIST    waiter's private BLPOP mailbox      (+ short TTL)
+rwlock:{r}:readers        ZSET    member = reader token, score = expire_at_ms   (live readers)
+rwlock:{r}:writer         HASH    { token, expire_at_ms }  (the single writer; PEXPIRE'd to lease)
+rwlock:{r}:queue          ZSET    member = request_id,   score = seq            (FIFO; O(log N) cancel)
+rwlock:{r}:req:{id}       HASH    one per waiting request (see 4.5)             (+ TTL)
+rwlock:{r}:notify:{id}    LIST    waiter's private BLPOP mailbox                (+ TTL)
 rwlock:{r}:seq            STRING  INCR -> monotonic queue order
 rwlock:{r}:fence          STRING  INCR -> monotonic fencing token
 ```
@@ -152,81 +153,78 @@ Plus one global key, written once when the script module is installed:
 rwlock:__module__         HASH    { protocol_version, impl_version, sha, loaded_at_ms }
 ```
 
-### 4.1 `rwlock:{r}:state` — hash (cached, fast-path state)
+### 4.1 State is DERIVED, not cached (v2)
+
+There is **no denormalized state cache and no per-holder metadata**. Lock state is computed O(1) directly from the source-of-truth structures, so it cannot drift:
+
+- **mode** = `write` if `rwlock:{r}:writer` exists (and is live); else `read` if `ZCARD readers > 0`; else `none`.
+- **reader_count** = `ZCARD rwlock:{r}:readers` (after evicting expired readers).
+- **writer present** = `EXISTS rwlock:{r}:writer` (after clearing an expired writer).
+- **queued_writers** = derived by the prune step (Appendix A) from the live `req` hashes in the queue — **never** an incremental counter. (An incremental counter cannot be maintained when a queued waiter crashes and its `req` hash TTL-expires, leaving an orphan queue entry; deriving it from truth is the only drift-free option.)
+
+### 4.2 `rwlock:{r}:readers` — sorted set (live readers)
+
+One entry per live reader. `score = expire_at_ms` (Redis server time). Evict expired readers with `ZREMRANGEBYSCORE readers 0 <now>`; count with `ZCARD`. Tokens are self-describing (Section 5), so no separate reader metadata is stored.
+
+### 4.3 `rwlock:{r}:writer` — hash (the single writer)
 
 ```
-mode             = "none" | "read" | "write"
-reader_count     = integer   (number of live readers)
-writer_token     = token | "" (set iff mode == write)
-queued_writers   = integer   (number of write requests currently in the queue)
+token        = the writer's grant token
+expire_at_ms = absolute server-time lease expiry
 ```
 
-`mode`, `reader_count`, and `queued_writers` are **denormalized caches** maintained transactionally inside the scripts. The `holders` ZSET is the source of truth; the cache exists so the fast path makes O(1) policy decisions without scanning. Because every mutation is atomic Lua, the cache cannot drift.
-
-### 4.2 `rwlock:{r}:holders` — sorted set (single source of truth for who holds)
-
-One entry per active holder (each reader, or the one writer). `score = expire_at_ms` (Redis server time). This unified set makes two hot operations one command each:
-
-- evict expired holders: `ZREMRANGEBYSCORE holders 0 <now>`
-- "is anyone holding?": `ZCARD holders`
-
-### 4.3 `rwlock:{r}:holder_meta` — hash
-
-`token -> json`:
-
-```json
-{ "mode": "read" | "write", "owner_id": "...", "fencing": 12345, "request_id": "..." }
-```
-
-`request_id` is stored so a timed-out waiter that was granted at the last instant can be reconciled (Section 8.4). Entries are deleted whenever the matching holder is removed.
+The key is `PEXPIRE`'d to the lease, so a crashed writer's key **self-expires natively** (reclaiming the lock without any library action and firing a `__keyevent@<db>__:expired` event used by the optional recovery subscriber, Section 10.3). Liveness is nonetheless re-checked against `expire_at_ms` so behavior never depends on Redis's sampled-expiry timing. A writer holds iff the key exists and `expire_at_ms > now`.
 
 ### 4.4 `rwlock:{r}:queue` — sorted set (FIFO wait queue)
 
-`member = request_id`, `score = seq` (from `INCR rwlock:{r}:seq`). FIFO order = ascending score. Using a ZSET (not a list) means cancellation is a direct `ZREM` in O(log N) — no tombstones, no head-only cleanup, no accumulation under bursty cancellation.
+`member = request_id`, `score = seq` (from `INCR rwlock:{r}:seq`). FIFO order = ascending score. A ZSET (not a list) makes cancellation a direct `ZREM` in O(log N).
 
 ### 4.5 `rwlock:{r}:req:{id}` — hash (one per waiting request)
 
 ```
-mode            = "read" | "write"
-owner_id        = caller-supplied owner identity
-lease_ms        = requested hold duration (applied when granted)
-wait_deadline_ms= absolute server-time deadline for waiting
-notify_key      = rwlock:{r}:notify:{id}
-granted_token   = ""  (set to the token when grant_from_queue grants this request)
-created_at_ms   = server time at enqueue
+mode             = "read" | "write"
+owner_id         = caller-supplied owner identity
+lease_ms         = requested hold duration (applied when granted)
+wait_deadline_ms = absolute server-time deadline for waiting
+notify_key       = rwlock:{r}:notify:{id}
+granted_token    = ""  (set to the token when this request is granted)
+created_at_ms    = server time at enqueue
+fairness         = "write_preferring" | "fifo" | "read_preferring"
+max_reader_batch = integer
 ```
 
-TTL: `wait_ms + request_key_ttl_grace_ms` (default grace 60s) so abandoned requests self-clean.
+`fairness` and `max_reader_batch` are persisted per request because **grant decisions read them from the head request** (the governing policy is the head request's — fairness is expected uniform per resource namespace). TTL: `wait_ms + request_key_ttl_grace_ms` (default grace 60s) as a GC backstop; correctness does not depend on it — the prune step (Appendix A) removes timed-out and orphaned entries and is authoritative.
 
 ### 4.6 `rwlock:{r}:notify:{id}` — list (private mailbox)
 
-The waiter blocks here: `BLPOP rwlock:{r}:notify:{id} <wait_seconds>`. When the lock is granted to this request, the granting script does `LPUSH notify_key <grant_payload>` then `PEXPIRE notify_key <notify_key_ttl_ms>`. Grant payload format in Appendix B.
+The waiter blocks here: `BLPOP rwlock:{r}:notify:{id} <seconds>`. On grant the script does `LPUSH notify_key <grant_payload>` then `PEXPIRE notify_key max(notify_key_ttl_ms, lease_ms)` — so a granted-but-undrained mailbox never expires before the holder it created (a brief reconnect cannot lose the grant). Grant payload format in Appendix B.
 
 ---
 
 ## 5. Time, IDs, and tokens
 
 - **Time source is Redis, always.** Scripts obtain `now_ms` from the Redis `TIME` command inside the script; clients pass *durations* (`lease_ms`, `wait_ms`), never absolute timestamps. This removes cross-client clock-skew from all expiry decisions. (`TIME` is permitted in scripts on modern Redis under effects replication.)
-- **`request_id`**: unique per acquire attempt. Recommended: a sortable unique id (UUIDv7 / ULID).
-- **`token`**: unique per *granted* hold. Recommended: `"<client_id>:<owner_id>:<nonce>"`. The token is required to release or extend; release/extend MUST verify the token (delete-/extend-if-value-matches), so a caller can never release another holder's lock.
-- **`owner_id`**: a caller-chosen identity for "who" holds it (process id, worker id, logical actor). `require_owner_id` defaults to true.
+- **`request_id`**: unique per acquire attempt. Recommended: a sortable unique id (UUIDv7 / ULID). MUST NOT contain `:`, `{`, or `}` (it is embedded in the token and used as a key suffix). Any format satisfying uniqueness + this charset interoperates.
+- **`token`**: unique per *granted* hold. The canonical grammar is **`"<owner_id>:<request_id>:<fencing>"`** — minted by the shared scripts (a port must never mint tokens itself). `owner_id` MUST NOT contain `:`. The token is required to release or extend; release/extend MUST verify the token, so a caller can never release another holder's lock. Treat the token as opaque; the grammar is fixed only so all ports mint identical, collision-free tokens (`request_id` guarantees per-attempt uniqueness, `fencing` per-grant).
+- **`owner_id`**: a caller-chosen identity for "who" holds it (process id, worker id, logical actor); MUST NOT contain `:`. `require_owner_id` defaults to true.
 - **`fencing`**: monotonic integer from `INCR rwlock:{r}:fence`, returned on every grant (Section 12).
 
 ---
 
 ## 6. Server-side scripts — overview and the shared grant algorithm
 
-Five scripts. All share one internal routine, `grant_from_queue`.
+Six scripts. All share one internal routine, `grant_from_queue`.
 
 ```
 acquire            try immediate grant; else enqueue and return a mailbox to block on
 release            free a holder; immediately grant the next eligible waiter(s)
-extend             renew the calling holder's lease
+extend             renew the calling holder's lease (never shortens it)
 cancel_wait        remove a timed-out/cancelled waiter; reconcile a last-instant grant
 expire_and_grant   maintenance: evict expired holders/requests, then grant eligible waiters
+inspect            read-only debug snapshot (no-writes; Section 18)
 ```
 
-`acquire`, `release`, `extend`, and `expire_and_grant` all begin by **evicting expired holders** (`ZREMRANGEBYSCORE holders 0 now`) and dropping timed-out requests, then recomputing the `state` cache. This makes correctness self-healing on every operation.
+The mutating scripts begin with **sweep** (evict expired readers via `ZREMRANGEBYSCORE readers 0 now`; clear an expired `writer`) and **prune** (drop timed-out/orphaned queue entries and derive `queued_writers` from the survivors). State is recomputed from truth, never cached, so correctness is self-healing on every operation.
 
 ### 6.1 `grant_from_queue(r, now)` — the heart of the system
 
@@ -234,38 +232,35 @@ This decides who wakes up. It is called after any event that may free capacity (
 
 ```
 grant_from_queue(r, now):
-  evict expired holders; drop timed-out requests at relevant positions
-  recompute mode / reader_count / writer_token from holders
-
-  if writer_token is set:                 # a writer holds -> nobody else proceeds
+  sweep(r, now)                            # evict expired readers; clear expired writer
+  prune_queue(r, now)                      # drop timed-out/orphan reqs; recompute queued_writers
+  if writer present:                       # a writer holds -> nobody else proceeds
       return 0
 
-  head = first request in queue (lowest seq) that is not timed out
+  head = first request in queue (lowest seq)
   if head is nil:
       return 0
+  fairness = head.fairness                 # the head request's policy governs
 
-  granted = 0
-  if reader_count > 0:
-      # readers currently hold. Only grant MORE readers, and only if policy permits
-      # jumping ahead of any queued writer.
-      if fairness == read_preferring OR queued_writers == 0:
-          granted += grant_contiguous_readers(r, now)   # capped by max_reader_batch
-      # if a writer is queued and policy is write_preferring/fifo, grant nobody now;
-      # the writer goes when current readers drain.
-      return granted
+  if reader_count > 0:                      # readers hold -> only MORE readers can join
+      if fairness == read_preferring:
+          return grant_readers_anywhere(r, now)   # grant readers, SKIPPING queued writers
+      return grant_contiguous_readers(r, now)     # stop at the first queued writer
 
-  # no holders at all -> serve the head
+  # no holders at all
+  if fairness == read_preferring:
+      g = grant_readers_anywhere(r, now)          # readers jump queued writers (writers may starve)
+      if g > 0: return g
+      if head.mode == "write": grant_writer(head, now); return 1
+      return 0
   if head.mode == "write":
-      grant_one_writer(head, now)                        # sets holders+meta+state, pushes notify
-      granted = 1
-  else: # head.mode == "read"
-      granted = grant_contiguous_readers(r, now)         # batch readers up to next writer
-  return granted
+      grant_writer(head, now); return 1
+  return grant_contiguous_readers(r, now)
 ```
 
-`grant_contiguous_readers` walks the queue from the head, granting consecutive `read` requests and **stopping at the first `write` request** (so a queued writer is never starved past its position), and stopping after `max_reader_batch` grants (so one release cannot block Redis waking 100k readers in a single script). Each granted reader is added to `holders` with `score = now + its lease_ms`, gets its `holder_meta`, has `granted_token` written into its `req` hash, and gets a grant payload `LPUSH`ed to its `notify_key`. The `state` cache (`reader_count`, `mode`) and `queued_writers` are updated as part of the same atomic script.
+`grant_contiguous_readers` walks the queue from the head, granting consecutive `read` requests and **stopping at the first `write` request** (so a queued writer is never starved past its position) and after `max_reader_batch` grants. `grant_readers_anywhere` (used only under `read_preferring`) grants **every** queued reader in FIFO order, *skipping over* queued writers — which is why `read_preferring` can starve writers, as documented. Each granted reader is added to `readers` with `score = now + lease_ms`, has `granted_token` written into its `req` hash, and gets a grant payload pushed to its `notify_key`. A granted writer sets the `writer` key (PEXPIRE'd to the lease).
 
-> Any readers beyond the batch cap (or behind a writer) remain queued and are woken on the next transition (when a current holder releases, or by `expire_and_grant`). They are never lost.
+> Any readers beyond the batch cap remain queued and are woken on the next transition. They are never lost.
 
 ### 6.2 Worked example (write-preferring / FIFO)
 
@@ -293,29 +288,33 @@ High read throughput, FIFO fairness, no writer starvation. Each waiter is woken 
 
 ## 7. Script contracts (inputs / outputs)
 
-All scripts take the resource's keys (derivable from `r`) plus `ARGV`. Return values are arrays (RESP) decoded by the client. `now_ms` is read from `TIME` inside the script — never passed in.
+Every script receives `KEYS[1] = rwlock:{r}` (the prefix; Section 4) plus `ARGV`. `now_ms` is read from `TIME` inside the script — never passed in. All limit-style ARGV (`lease_ms`, `wait_ms`, `max_reader_batch`) are **clamped server-side** to the protocol limits (Section 19), so a misbehaving client cannot impose an out-of-range lease on others.
+
+### 7.0 Decoding contract (all scripts)
+
+Every script returns a **flat positional array** (RESP). Clients MUST decode by position and MUST NOT rely on map decoding — under RESP3 some clients surface Lua tables as maps; pin array decoding. Integers are returned as integers, strings as strings; clients coerce defensively. `inspect` returns a positional array (Section 7.6), not the JSON object shown for readability in Section 18.
 
 ### 7.1 `acquire`
 
-`ARGV`: `mode("read"|"write")`, `lease_ms`, `wait_ms`, `request_id`, `owner_id`, `fairness`, `max_reader_batch`
+`ARGV`: `mode("read"|"write")`, `lease_ms`, `wait_ms`, `request_id`, `owner_id`, `fairness`, `max_reader_batch`, `notify_key_ttl_ms`, `request_key_ttl_grace_ms`
 
 Returns one of:
 
 ```
 ["GRANTED", token, fencing, lease_until_ms, mode]
-["QUEUED",  request_id, notify_key, wait_deadline_ms, head_holder_lease_until_ms]
+["QUEUED",  request_id, notify_key, wait_deadline_ms, next_wake_ms]
 ```
 
-`head_holder_lease_until_ms` is the soonest current-holder expiry (or `-1` if none); the client uses it to size its self-wake (Section 10). A read may be granted immediately when there is no writer and (policy is read-preferring OR no writer is queued). A write may be granted immediately when there are no holders at all.
+`next_wake_ms` is the soonest absolute time at which something actionable could happen for this waiter — the soonest of any holder's lease expiry and the head queued request's `wait_deadline_ms` (or `-1` if neither). The client blocks until then to self-wake (Section 8/10); this is what lets a waiter reclaim a *crashed queued holder or head request* rather than blocking for its full `wait_ms`. A read may be granted immediately when no writer holds and (policy is read_preferring; or write_preferring and no writer queued; or fifo and the queue is empty). A write may be granted immediately when there are no holders and the queue is empty.
 
 ### 7.2 `release`
 
-`ARGV`: `token`
+`ARGV`: `token`, `notify_key_ttl_ms`
 
 Returns:
 
 ```
-["OK"]          token was a live holder; removed; grant_from_queue executed
+["OK"]          token was a live holder (writer or reader); removed; grant_from_queue executed
 ["NOT_HELD"]    token absent or already expired (idempotent no-op for the caller)
 ```
 
@@ -326,15 +325,15 @@ Returns:
 Returns:
 
 ```
-["OK", new_lease_until_ms]   token is the live holder; expiry updated
+["OK", new_lease_until_ms]   token is the live holder; expiry updated (never moved earlier)
 ["LOST"]                     token is no longer a holder (expired or released) -> caller lost the lock
 ```
 
-(The "extend only with safety margin" rule is enforced **client-side** before calling; the script only checks liveness.)
+Extend never shortens the lease (GT semantics), so passing a smaller `lease_ms` cannot drop the lock early. The "extend only within a safety margin" rule is enforced **client-side** before calling (Section 9.2); the script only checks liveness and renews.
 
 ### 7.4 `cancel_wait`
 
-`ARGV`: `request_id`
+`ARGV`: `request_id`, `notify_key_ttl_ms`
 
 Returns:
 
@@ -342,20 +341,31 @@ Returns:
 ["CANCELLED"]            request was still queued; removed; grant_from_queue re-run if it was the head
 ["RECLAIMED", token]     request had already been granted at the last instant; the just-granted
                          holder was released and grant_from_queue re-run (see 8.4)
-["GONE"]                 request not found (already cleaned)
+["GONE"]                 request not found; any orphan queue entry is dropped
 ```
+
+`cancel_wait` MUST be called at most once per request (the client calls it exactly once, in `finish_timeout`).
 
 ### 7.5 `expire_and_grant`
 
-`ARGV`: (none beyond keys)
+`ARGV`: `notify_key_ttl_ms`
 
 Returns:
 
 ```
-["OK", granted_count]
+["OK", granted_count, next_wake_ms]
 ```
 
-Pure maintenance: evict expired holders, drop timed-out requests, recompute state, `grant_from_queue`. Used by the self-wake path and (optionally) the keyspace-expiry handler. It is **not** required for normal releases, which grant directly.
+Pure maintenance: sweep, prune, `grant_from_queue`. `next_wake_ms` lets a waiter refresh its self-wake boundary after running maintenance. Used by the self-wake path and (optionally) the keyspace-expiry handler; **not** required for normal releases, which grant directly.
+
+### 7.6 `inspect` (read-only)
+
+`ARGV`: `notify_key_ttl_ms` is **not** taken; `ARGV`: (none beyond the key). Registered as a **no-writes** function. Returns a positional array:
+
+```
+[mode("none"|"read"|"write"), reader_count, writer_active(0|1),
+ queue_length, queued_writers, oldest_wait_ms(-1 if none), next_expiry_ms(-1 if none)]
+```
 
 ---
 
@@ -376,33 +386,33 @@ if res.status == "GRANTED":
 # QUEUED -> block on the private mailbox, no polling
 notify_key       = res.notify_key
 wait_deadline_ms = res.wait_deadline_ms
-holder_lease_ms  = res.head_holder_lease_until_ms
-return wait_for_grant(r, request_id, notify_key, wait_deadline_ms, holder_lease_ms)
+next_wake_ms     = res.next_wake_ms
+return wait_for_grant(r, request_id, notify_key, wait_deadline_ms, next_wake_ms)
 ```
 
 ### 8.2 `wait_for_grant` — block until handed the lock
 
-The waiter blocks on `BLPOP`. It only ever "wakes early" to detect a **crashed holder** at that holder's lease boundary; between boundaries it is fully blocked. This is **not polling** — it is a single bounded check tied to a concrete deadline, and it disappears entirely when keyspace events are enabled.
+The waiter blocks on `BLPOP`. It only ever "wakes early" at `next_wake_ms` — the soonest crashed-holder lease boundary **or** the head queued request's deadline (so a crashed *queued* head, not just a crashed holder, is reclaimed). Between boundaries it is fully blocked. This is **not polling** — it is a single bounded check tied to a concrete deadline, and it disappears entirely when keyspace events are enabled. The server-time offset is derived once from a `TIME` sample at init; `epsilon`/`floor`/`clamp` are client-local, non-interop tuning constants.
 
 ```
-wait_for_grant(r, request_id, notify_key, wait_deadline_ms, holder_lease_ms):
+wait_for_grant(r, request_id, notify_key, wait_deadline_ms, next_wake_ms):
   loop:
-      now = local_monotonic_now()              # only to compute timeouts; expiry truth is server-side
       remaining_ms = wait_deadline_ms - server_now_estimate()
       if remaining_ms <= 0:
           return finish_timeout(r, request_id, notify_key)
 
-      # block until the lease boundary (to catch a crashed holder) or the wait deadline
-      boundary_ms = (holder_lease_ms > 0) ? (holder_lease_ms - server_now_estimate() + epsilon) : remaining_ms
+      # block until the next interesting event (a lease boundary or the head's deadline)
+      # or our own wait deadline, whichever is sooner
+      boundary_ms = (next_wake_ms > 0) ? (next_wake_ms - server_now_estimate() + epsilon) : remaining_ms
       blpop_ms    = clamp(min(remaining_ms, boundary_ms), floor_ms, remaining_ms)
 
       payload = BLPOP(notify_key, blpop_ms / 1000)     # dedicated blocking connection (Section 15)
       if payload != nil:
           return Handle.from(payload)                  # GRANTED, immediate
 
-      # woke without a grant -> likely a crashed holder; run maintenance once, then re-block
-      r2 = CALL expire_and_grant(r)                    # may push a grant into our mailbox
-      holder_lease_ms = peek_head_holder_lease(r)      # refresh boundary for next iteration
+      # woke without a grant -> a holder/head may have crashed; run maintenance once,
+      # refresh the boundary from its return, then re-block
+      [_, _, next_wake_ms] = CALL expire_and_grant(r)  # may push a grant into our mailbox
       # loop; we will receive any grant via the next BLPOP
 ```
 
@@ -445,7 +455,7 @@ If a waiter's wait deadline elapses at the same instant `grant_from_queue` grant
 
 `CALL extend(token, lease_ms)`. Returns `OK` with the new expiry, or `LOST` if the token is no longer a holder. A `LOST` result means **the lock was lost mid-operation** — the caller must stop touching the resource. The scoped API turns `LOST` into cancellation of the caller's context/signal.
 
-**Client-side safety margin (required):** only attempt extension while `server_now < lease_until_ms - extension_margin_ms`, where `extension_margin_ms = max(500, p99_redis_latency_ms * 4)`. Extending too close to expiry risks the renewal landing after the lock was already reclaimed.
+**Client-side safety margin (required):** only attempt extension while `server_now < lease_until_ms - extension_margin_ms`, where `extension_margin_ms = max(500, p99_redis_latency_ms * 4)`. Extending too close to expiry risks the renewal landing after the lock was already reclaimed; within the margin the client treats the lock as lost. This margin *reduces but does not eliminate* the race — the script's own server-side `expire_at_ms <= now` re-check is the actual safety net, and `extend` never moves the expiry earlier (so a shorter `lease_ms` cannot drop the lock).
 
 ### 9.3 Watchdog (opt-in)
 
@@ -453,7 +463,7 @@ When enabled, a client-side timer refreshes the lease at roughly `lease_ms / 3` 
 
 ### 9.4 Reentrancy (optional extension, default off)
 
-To support the same `owner_id` re-acquiring, maintain a per-owner refcount (in `state` for the writer; in `holder_meta` for readers) and release decrements rather than removing until zero. Keep it clearly flagged and off by default; v1 cores may omit it. Matches Go's non-reentrant `sync.RWMutex` when off.
+To support the same `owner_id` re-acquiring, maintain a per-owner refcount and have release decrement rather than remove until zero. Any added fields are a `PROTOCOL_VERSION` bump and must be specified before use. Keep it clearly flagged and off by default; v2 cores may omit it. Matches Go's non-reentrant `sync.RWMutex` when off.
 
 ---
 
@@ -465,7 +475,7 @@ To support the same `owner_id` re-acquiring, maintain a per-owner refcount (in `
 
 2. **Per-waiter self-wake (always, zero dependencies).** A waiter knows the current holder's lease deadline (returned by `acquire` and refreshed by `expire_and_grant`). It blocks until that boundary; if no grant arrived, the holder likely crashed, so it runs `expire_and_grant` once and re-blocks. Bounded, concrete, not a poll (Section 8.2). This makes crash recovery work even on Redis where keyspace events are disabled.
 
-3. **Keyspace-expiry events (optional, opt-in, auto-detected).** If the user's Redis has `notify-keyspace-events` including expired (`Kx`/`Ex`) enabled, the library MAY run an in-process background subscriber on `__keyevent@<db>__:expired` (per node in Cluster) that calls `expire_and_grant` for the affected resource, eliminating the self-wake latency. Caveats to honor: expired events fire when Redis actually deletes the key (on access or via its sampled active-expiry cycle), **not** exactly at TTL zero, so timing is approximate; and in Cluster each node only emits events for its own keyspace. We **never** call `CONFIG SET` to enable this; if it is off, we silently use layer 2.
+3. **Keyspace-expiry events (optional, opt-in, auto-detected).** The `writer` key is `PEXPIRE`'d to its lease, so a **crashed writer's key self-expires natively** — Redis reclaims it without any library action, and (if `notify-keyspace-events` includes expired, `Ex`/`Kx`) fires a `__keyevent@<db>__:expired` event. If enabled, the library MAY run an in-process subscriber on `__keyevent@*__:expired` (per node in Cluster) that, on any `rwlock:{r}:*` key expiry, calls `expire_and_grant` for that resource — promptly granting a waiter without a self-wake round-trip. (Readers live in a ZSET with no per-member TTL, so a crashed *reader* fires no event and is recovered by a waiting writer's self-wake; this is acceptable since a stale reader only reduces the count.) Caveats: expired events fire when Redis actually deletes the key (sampled active-expiry or on access), **not** exactly at TTL zero, so timing is approximate; in Cluster each node emits only for its own keyspace. We **never** call `CONFIG SET`; if events are off we silently use layer 2.
 
 > An always-on "expiry dispatcher" with a global deadline index is deliberately **out of scope**: it would require leader election or sharded ownership to operate, it concentrates writes on a single global key (a hot slot that breaks the otherwise clean per-resource horizontal scaling), and — most importantly — it is infrastructure the user would have to run. A library must not require it. (Teams that want one can build it on top of `expire_and_grant`; we do not ship or require it.)
 
@@ -473,7 +483,7 @@ To support the same `owner_id` re-acquiring, maintain a per-owner refcount (in `
 
 ## 11. Fairness policies and writer-starvation prevention
 
-A per-acquisition / per-namespace `fairness` setting, enforced entirely inside the scripts:
+A `fairness` setting, enforced entirely inside the scripts. It is persisted on each request and the **head request's policy governs** a grant decision; it is therefore expected to be **uniform per resource namespace** (mixing policies on one resource is unsupported — the head's wins). The policies:
 
 - **`write_preferring` (default).** A queued writer blocks *new* readers from jumping ahead, even while readers currently hold. Existing readers drain, then the writer goes. This mirrors Go's `sync.RWMutex`, where a blocked `Lock` excludes new readers so the lock eventually becomes available. Prevents writer starvation without fully serializing.
 - **`fifo`.** Strict queue order; contiguous readers at the head are still batched. Strongest fairness; slightly lower read throughput under mixed load.
@@ -613,10 +623,10 @@ If a deployment is connection-constrained but watches many locks, an optional al
 
 Once published you cannot recall a release, and **mixed client versions will contend on the same locks in the same Redis** (one service upgrades before another). So:
 
-- The Lua/Functions module embeds `PROTOCOL_VERSION` (an integer) and writes `rwlock:__module__ = { protocol_version, impl_version, sha, loaded_at_ms }` when installed.
-- On connect, the client reads `rwlock:__module__`. If the server's `protocol_version` major is **incompatible** with the client's, the client raises `IncompatibleServerLogic` rather than silently contending under foreign semantics. (A config flag may allow coexistence only when explicitly opted into.)
-- **SemVer, strictly.** Any change to the **wire protocol, key schema, script return contracts, or grant semantics is a MAJOR bump.** Two clients sharing the same MAJOR are guaranteed identical semantics and are safe to contend; different MAJORs must not share a resource namespace.
-- Installing/upgrading the module must be idempotent and safe under concurrent clients (e.g., load only if absent or version-newer; guard with a short lock or `FUNCTION LOAD REPLACE` semantics). Never leave a half-installed module.
+- The Lua/Functions module embeds `PROTOCOL_VERSION` (a **single integer**, currently **2**) and writes `rwlock:__module__ = { protocol_version, impl_version, sha, loaded_at_ms }` when installed. `loaded_at_ms` is Redis server time (§5); `impl_version` is informational and never used in compatibility decisions.
+- **Compatibility is exact-integer equality** on `protocol_version`. On connect the client reads `rwlock:__module__`; if it exists and its `protocol_version` differs from the client's, the client raises `IncompatibleServerLogic` rather than silently contending under foreign semantics. (A config flag may allow coexistence only when explicitly opted into.) There is no major/minor split — every protocol change bumps the integer and is mutually incompatible by construction.
+- **Any change to the wire protocol, key schema, script return contracts, or grant semantics bumps `PROTOCOL_VERSION`.** Clients with the same `PROTOCOL_VERSION` are guaranteed identical semantics and are safe to contend; different versions must not share a resource namespace. (v1 → v2 changed the key schema and grant algorithm; they are incompatible.)
+- **Install algorithm (normative).** On connect: (1) attempt `FUNCTION LOAD REPLACE <library>` (idempotent; on failure fall back to `SCRIPT LOAD`/`EVALSHA` — Section 17); (2) read `rwlock:__module__`; if absent, `HSET` it. `FUNCTION LOAD REPLACE` and the marker write are each individually idempotent and safe under concurrent installers (all write identical values). If a crash leaves the module loaded but the marker absent, the next client simply writes the marker. The client must never assume the marker's presence implies its *own* version is loaded — it always (re)loads its library, then checks the marker for an incompatible peer.
 
 Document the cross-version contention guarantee explicitly in the README.
 
@@ -689,7 +699,7 @@ transport               = "blpop"                 # alt: "sharded_pubsub" (Redis
 keyspace_events         = "auto"                   # use if enabled; never CONFIG SET
 ```
 
-All limits are enforced (clamp or reject out-of-range `leaseMs`/`waitMs`).
+All limits are enforced **server-side, in the Lua** (the brain clamps `lease_ms`, `wait_ms`, and `max_reader_batch` to the protocol limits), so a misbehaving or non-conforming client cannot impose an out-of-range lease that other clients must honor. Clients SHOULD also clamp locally for fast feedback, but the brain's clamp is authoritative. `notify_key_ttl_ms` and `request_key_ttl_grace_ms` are transmitted per call (Section 7), not read from server-side config.
 
 ---
 
@@ -744,7 +754,7 @@ A TLA+ / FizzBee model of the state machine asserting the safety invariants is r
 
 ### 20.10 Conformance suite (cross-language)
 
-Maintain a **language-agnostic scenario file** (e.g. a list of timed operations + expected outcomes) plus the shared Lua. Every language port MUST pass the same scenarios against the same Lua, ideally including a **mixed-language test** (e.g. a Go writer contending with a Python reader) proving real interop.
+Maintain a **language-agnostic scenario file** plus the shared Lua. The normative format and runner contract live in `protocol/conformance/README.md`; a port is "done" only when it passes the shared scenarios. The current format is **sequential** (single logical client) and pins immediate-grant / queue-then-timeout / hand-off / fencing monotonicity. Proving real interop additionally requires **concurrent** scenarios (per-step `client` ids, a barrier/ordering construct, and `inspect`-based state assertions) and a **mixed-language** test (e.g. a Go writer contending with a Python reader); these and the runner contract are introduced with the second-language port. Until then, treat the cross-language interop claim (§0) as *designed-for* but not yet *proven*.
 
 ---
 
@@ -784,125 +794,131 @@ Implement the **reference language first** (recommend Node.js or Python for fast
 
 ## Appendix A: full script pseudocode
 
-> Pseudocode, not drop-in Lua, but precise about ordering and effects. `now = redis.TIME()` at the top of each mutating script. All writes for resource `r` touch only `{r}` keys. `state` cache (`mode`, `reader_count`, `writer_token`, `queued_writers`) is updated in lockstep with `holders`/`queue` mutations.
+> Pseudocode, not drop-in Lua, but precise about ordering and effects (v2). `now = redis.TIME()` at the top of each mutating script. `KEYS[1]` is the prefix `rwlock:{r}`; all keys are derived from it. State is **derived from truth** (`readers`/`writer`/`queue`), never cached.
 
 ### A.1 Shared helpers
 
 ```
 sweep(r, now):
-    ZREMRANGEBYSCORE holders 0 now            # drop expired holders
-    for each expired token removed: HDEL holder_meta token
-    recompute_state_cache(r)                  # mode, reader_count, writer_token from holders
+    ZREMRANGEBYSCORE readers 0 now                       # evict expired readers
+    if EXISTS writer and writer.expire_at_ms <= now: DEL writer
 
-recompute_state_cache(r):
-    members = ZRANGE holders 0 -1
-    writer  = the member whose holder_meta.mode == "write", if any
-    if writer: state.mode="write"; state.writer_token=writer; state.reader_count=0
-    elif members nonempty: state.mode="read"; state.writer_token=""; state.reader_count=len(members)
-    else: state.mode="none"; state.writer_token=""; state.reader_count=0
+writer_held(r)   -> EXISTS writer                         # call after sweep
+reader_count(r)  -> ZCARD readers                         # call after sweep
 
-drop_timed_out_head_requests(r, now):
-    while queue head h exists and req[h].wait_deadline_ms <= now and req[h].granted_token == "":
-        ZREM queue h ; DEL req[h]              # never drop an already-granted request here
+# Drop timed-out and orphaned queue entries ANYWHERE in the queue, and RETURN the
+# number of live queued writers — derived from the surviving req hashes, never an
+# incremental counter (which drifts permanently on a crashed queued writer).
+prune_queue(r, now) -> queued_writers:
+    writers = 0
+    for id in ZRANGE queue 0 -1:
+        wd = req[id].wait_deadline_ms ; gt = req[id].granted_token
+        if wd is nil:                 ZREM queue id                 # orphan: req hash gone
+        elif wd <= now and gt == "":  ZREM queue id ; DEL req[id]   # timed out, not granted
+        elif req[id].mode == "write": writers += 1
+    return writers
 
-grant_one_writer(req_id, now):
-    token = new_token(req[req_id].owner_id)
-    fencing = INCR fence
-    expire_at = now + req[req_id].lease_ms
-    ZADD holders expire_at token
-    HSET holder_meta token = {mode:"write", owner_id, fencing, request_id:req_id}
-    state.mode="write"; state.writer_token=token; state.reader_count=0
-    HSET req[req_id].granted_token = token
-    state.queued_writers -= 1
-    push_grant(req_id, token, fencing, expire_at, "write")
-    ZREM queue req_id
+# Soonest absolute time something actionable could happen for a waiter.
+next_wake(r, now) -> ms:
+    best = min over { soonest readers score, writer.expire_at_ms, head req.wait_deadline_ms }
+    return best or -1
 
-grant_contiguous_readers(r, now) -> count:
-    count = 0
-    while count < max_reader_batch:
-        h = queue head (lowest seq, not timed-out)
-        if h is nil or req[h].mode == "write": break      # stop at a queued writer
-        token = new_token(req[h].owner_id)
-        fencing = INCR fence
-        expire_at = now + req[h].lease_ms
-        ZADD holders expire_at token
-        HSET holder_meta token = {mode:"read", owner_id, fencing, request_id:h}
-        HSET req[h].granted_token = token
-        push_grant(h, token, fencing, expire_at, "read")
-        ZREM queue h
-        count += 1
-    if count > 0: recompute_state_cache(r)                # now read mode
-    return count
-
-push_grant(req_id, token, fencing, expire_at, mode):
+push_grant(req_id, token, fencing, expire_at, mode, now):
     payload = json{status:"GRANTED", token, fencing, lease_until_ms:expire_at, mode}
     LPUSH req[req_id].notify_key payload
-    PEXPIRE req[req_id].notify_key notify_key_ttl_ms
+    PEXPIRE req[req_id].notify_key max(notify_key_ttl_ms, expire_at - now)
+
+new_token(owner_id, req_id, fencing) -> owner_id ":" req_id ":" fencing
+
+grant_writer(req_id, now):
+    fencing = INCR fence ; token = new_token(req[req_id].owner_id, req_id, fencing)
+    expire_at = now + req[req_id].lease_ms
+    HSET writer {token, expire_at_ms: expire_at} ; PEXPIRE writer req[req_id].lease_ms
+    HSET req[req_id].granted_token = token
+    push_grant(req_id, token, fencing, expire_at, "write", now) ; ZREM queue req_id
+
+grant_reader(id, now):
+    fencing = INCR fence ; token = new_token(req[id].owner_id, id, fencing)
+    expire_at = now + req[id].lease_ms
+    ZADD readers expire_at token
+    HSET req[id].granted_token = token
+    push_grant(id, token, fencing, expire_at, "read", now) ; ZREM queue id
+
+grant_contiguous_readers(r, now) -> count:          # write_preferring / fifo
+    count = 0
+    while head h exists and req[h].mode == "read" and count < req[h].max_reader_batch:
+        grant_reader(h, now) ; count += 1
+    return count
+
+grant_readers_anywhere(r, now) -> count:            # read_preferring (skips queued writers)
+    count = 0
+    for id in ZRANGE queue 0 -1:
+        if req[id].mode == "read" and count < req[id].max_reader_batch:
+            grant_reader(id, now) ; count += 1
+    return count
 ```
 
 ### A.2 `grant_from_queue`
 
 ```
 grant_from_queue(r, now) -> granted:
-    sweep(r, now)
-    drop_timed_out_head_requests(r, now)
-    if state.writer_token != "": return 0
-    h = queue head (not timed-out)
-    if h is nil: return 0
-    if state.reader_count > 0:
-        if fairness == "read_preferring" or state.queued_writers == 0:
-            return grant_contiguous_readers(r, now)
-        return 0                                          # writer queued -> wait for readers to drain
-    if req[h].mode == "write":
-        grant_one_writer(h, now); return 1
-    else:
+    sweep(r, now) ; prune_queue(r, now)
+    if writer_held(r): return 0
+    h = queue head ; if h is nil: return 0
+    fairness = req[h].fairness
+    if reader_count(r) > 0:
+        if fairness == "read_preferring": return grant_readers_anywhere(r, now)
         return grant_contiguous_readers(r, now)
+    if fairness == "read_preferring":
+        g = grant_readers_anywhere(r, now) ; if g > 0: return g
+        if req[h].mode == "write": grant_writer(h, now); return 1
+        return 0
+    if req[h].mode == "write": grant_writer(h, now); return 1
+    return grant_contiguous_readers(r, now)
 ```
 
 ### A.3 `acquire`
 
 ```
-acquire(r, mode, lease_ms, wait_ms, request_id, owner_id, fairness, max_reader_batch):
+acquire(r, mode, lease_ms, wait_ms, request_id, owner_id, fairness, max_reader_batch,
+        notify_key_ttl_ms, request_key_ttl_grace_ms):
     now = redis.TIME()
+    lease_ms = clamp(lease_ms, 1, MAX_LEASE_MS) ; wait_ms = clamp(wait_ms, 0, MAX_WAIT_MS)
+    max_reader_batch = clamp(max_reader_batch, 1, MAX_READER_BATCH)
     sweep(r, now)
-    drop_timed_out_head_requests(r, now)
-
+    queued_writers = prune_queue(r, now)
     grantable =
-        (mode == "read"  and state.writer_token == "" and
-              (fairness == "read_preferring" or state.queued_writers == 0))
-     or (mode == "write" and state.writer_token == "" and state.reader_count == 0
-              and queue is empty)                          # writer takes free lock only if queue empty
+        (mode == "read" and not writer_held(r) and
+            (fairness == "read_preferring"
+             or (fairness == "fifo" and queue is empty)
+             or queued_writers == 0))                      # write_preferring
+     or (mode == "write" and not writer_held(r) and reader_count(r) == 0 and queue is empty)
 
     if grantable:
-        if mode == "write":
-            token, fencing, expire_at = inline grant of a writer (no req hash needed)
-            return ["GRANTED", token, fencing, expire_at, "write"]
-        else:
-            token, fencing, expire_at = inline grant of a reader
-            return ["GRANTED", token, fencing, expire_at, "read"]
+        fencing = INCR fence ; token = new_token(owner_id, request_id, fencing)
+        expire_at = now + lease_ms
+        if mode == "write": HSET writer {token, expire_at_ms: expire_at}; PEXPIRE writer lease_ms
+        else:               ZADD readers expire_at token
+        return ["GRANTED", token, fencing, expire_at, mode]
 
-    # enqueue
+    # enqueue (no req hash on the immediate path above; only here)
     seq = INCR seq
-    notify_key = "rwlock:{r}:notify:" + request_id
     HSET req[request_id] = {mode, owner_id, lease_ms, wait_deadline_ms: now+wait_ms,
-                            notify_key, granted_token:"", created_at_ms: now}
+        notify_key: "rwlock:{r}:notify:"+request_id, granted_token:"", created_at_ms: now,
+        fairness, max_reader_batch}
     PEXPIRE req[request_id] (wait_ms + request_key_ttl_grace_ms)
     ZADD queue seq request_id
-    if mode == "write": state.queued_writers += 1
-    head_holder_lease = ZRANGE holders WITHSCORES limit 1  (min score) or -1
-    return ["QUEUED", request_id, notify_key, now+wait_ms, head_holder_lease]
+    return ["QUEUED", request_id, req.notify_key, now+wait_ms, next_wake(r, now)]
 ```
 
 ### A.4 `release`
 
 ```
 release(token):
-    now = redis.TIME()
-    meta = HGET holder_meta token
-    if meta is nil or ZSCORE holders token is nil:
-        return ["NOT_HELD"]
-    ZREM holders token ; HDEL holder_meta token
-    recompute_state_cache(r)
+    now = redis.TIME() ; sweep(r, now)
+    if EXISTS writer and writer.token == token: DEL writer
+    elif ZSCORE readers token is not nil:        ZREM readers token
+    else: return ["NOT_HELD"]
     grant_from_queue(r, now)
     return ["OK"]
 ```
@@ -911,12 +927,15 @@ release(token):
 
 ```
 extend(token, lease_ms):
-    now = redis.TIME()
-    if HGET holder_meta token is nil or ZSCORE holders token is nil or ZSCORE holders token <= now:
-        return ["LOST"]
-    new_expire = now + lease_ms
-    ZADD holders new_expire token        # update score
-    return ["OK", new_expire]
+    now = redis.TIME() ; lease_ms = clamp(lease_ms, 1, MAX_LEASE_MS)
+    if EXISTS writer and writer.token == token:
+        if writer.expire_at_ms <= now: return ["LOST"]
+        new = max(now + lease_ms, writer.expire_at_ms)        # never shorten
+        HSET writer.expire_at_ms = new ; PEXPIRE writer (new - now) ; return ["OK", new]
+    score = ZSCORE readers token
+    if score and score > now:
+        new = max(now + lease_ms, score) ; ZADD readers new token ; return ["OK", new]
+    return ["LOST"]
 ```
 
 ### A.6 `cancel_wait`
@@ -924,22 +943,19 @@ extend(token, lease_ms):
 ```
 cancel_wait(request_id):
     now = redis.TIME()
-    if req[request_id] does not exist: return ["GONE"]
+    if req[request_id] does not exist: ZREM queue request_id ; return ["GONE"]
     granted = req[request_id].granted_token
     if granted == "":
         was_head = (queue head == request_id)
-        ZREM queue request_id
-        if req[request_id].mode == "write": state.queued_writers -= 1
-        DEL req[request_id]
+        ZREM queue request_id ; DEL req[request_id]
         if was_head: grant_from_queue(r, now)
         return ["CANCELLED"]
-    else:
-        # already granted at the last instant -> release that holder, hand on
-        ZREM holders granted ; HDEL holder_meta granted
-        DEL req[request_id]
-        recompute_state_cache(r)
-        grant_from_queue(r, now)
-        return ["RECLAIMED", granted]
+    # granted at the last instant -> release that holder (writer or reader), hand on
+    if EXISTS writer and writer.token == granted: DEL writer
+    elif ZSCORE readers granted is not nil:       ZREM readers granted
+    DEL req[request_id]
+    grant_from_queue(r, now)
+    return ["RECLAIMED", granted]
 ```
 
 ### A.7 `expire_and_grant`
@@ -947,29 +963,32 @@ cancel_wait(request_id):
 ```
 expire_and_grant(r):
     now = redis.TIME()
-    granted = grant_from_queue(r, now)   # sweep + drop-timed-out happen inside
-    return ["OK", granted]
+    granted = grant_from_queue(r, now)   # sweep + prune happen inside
+    return ["OK", granted, next_wake(r, now)]
 ```
 
 ---
 
 ## Appendix B: payload and handle formats
 
-**Grant payload** (pushed to `notify:{id}`, JSON string):
+Token grammar (§5): `"<owner_id>:<request_id>:<fencing>"`, e.g. `"worker-1:01J9Z…ULID:918273"`.
+
+**Grant payload** (pushed to `notify:{id}`, JSON string — snake_case on the wire):
 ```json
-{ "status": "GRANTED", "token": "c12:w3:9f2a", "fencing": 918273,
+{ "status": "GRANTED", "token": "worker-1:01J9Z...:918273", "fencing": 918273,
   "lease_until_ms": 1760000000000, "mode": "write" }
 ```
 
-**Handle** (returned to the caller):
+**Handle** (returned to the caller — camelCase in the public API). Wire→handle field mapping:
+`token`→`token`, `fencing`→`fencingToken`, `lease_until_ms`→`leaseUntilMs`, `mode`→`mode`, plus `resource`.
 ```json
-{ "resource": "order:123", "mode": "write", "token": "c12:w3:9f2a",
+{ "resource": "order:123", "mode": "write", "token": "worker-1:01J9Z...:918273",
   "fencingToken": 918273, "leaseUntilMs": 1760000000000 }
 ```
 
-**Module marker** (`rwlock:__module__`, written on install):
+**Module marker** (`rwlock:__module__`, written on install). `loaded_at_ms` is Redis server time; `impl_version` is informational (not used for compatibility):
 ```json
-{ "protocol_version": 1, "impl_version": "1.0.0", "sha": "<script-sha>",
+{ "protocol_version": 2, "impl_version": "0.0.0", "sha": "<function-library-sha1>",
   "loaded_at_ms": 1760000000000 }
 ```
 

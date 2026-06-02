@@ -47,15 +47,11 @@ function track<T>(p: Promise<T>): { done: boolean; value?: T; err?: unknown } {
   return s;
 }
 
-/** Read the denormalized state cache for assertions. */
+/** Snapshot resource state via the public inspect() (no internal-schema coupling). */
 async function readState(r: string): Promise<{ mode: string; readerCount: number; queuedWriters: number }> {
-  const client = await harness.newClient();
-  const h = (await client.hGetAll(`rwlock:{${r}}:state`)) as Record<string, string>;
-  return {
-    mode: h.mode ?? "none",
-    readerCount: Number(h.reader_count ?? 0),
-    queuedWriters: Number(h.queued_writers ?? 0),
-  };
+  const rw = await mk();
+  const s = await rw.inspect(r);
+  return { mode: s.mode, readerCount: s.readerCount, queuedWriters: s.queuedWriters };
 }
 
 describe("M1 read locks", () => {

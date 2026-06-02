@@ -2,7 +2,6 @@
 --
 -- KEYS[1] = prefix
 -- ARGV    = request_id, notify_key_ttl_ms
---
 -- Returns:
 --   { "CANCELLED" }          still queued; removed; grant_from_queue re-run if it was head
 --   { "RECLAIMED", token }   already granted at the buzzer; that holder released and handed on
@@ -25,18 +24,17 @@ if is_blank(granted) then
   local head = redis.call('ZRANGE', k.queue, 0, 0)
   local was_head = (#head > 0 and head[1] == request_id)
   redis.call('ZREM', k.queue, request_id)
-  if redis.call('HGET', rk, 'mode') == 'write' then dec_queued_writers(k) end
   redis.call('DEL', rk)
   if was_head then grant_from_queue(k, prefix, now, notify_ttl) end
-  arm_lease_sentinel(k, now)
   return { 'CANCELLED' }
 end
 
--- already granted at the last instant -> release that holder and hand on
-redis.call('ZREM', k.holders, granted)
-redis.call('HDEL', k.holder_meta, granted)
+-- already granted at the last instant -> release that holder (writer or reader) and hand on
+if redis.call('EXISTS', k.writer) == 1 and redis.call('HGET', k.writer, 'token') == granted then
+  redis.call('DEL', k.writer)
+elseif redis.call('ZSCORE', k.readers, granted) then
+  redis.call('ZREM', k.readers, granted)
+end
 redis.call('DEL', rk)
-recompute_state_cache(k)
 grant_from_queue(k, prefix, now, notify_ttl)
-arm_lease_sentinel(k, now)
 return { 'RECLAIMED', granted }

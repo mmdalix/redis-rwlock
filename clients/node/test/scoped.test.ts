@@ -32,7 +32,9 @@ const settle = (ms = 150) => new Promise((r) => setTimeout(r, ms));
 
 async function holderCount(r: string): Promise<number> {
   const client = await harness.newClient();
-  return Number(await client.zCard(`rwlock:{${r}}:holders`));
+  const readers = Number(await client.zCard(`rwlock:{${r}}:readers`));
+  const writer = Number(await client.exists(`rwlock:{${r}}:writer`));
+  return readers + writer;
 }
 
 describe("M3 scoped API", () => {
@@ -112,8 +114,7 @@ describe("M3 watchdog", () => {
         abortedReason = lock.signal.reason;
       });
       // simulate loss: forcibly evict this holder out from under us
-      await admin.del(`rwlock:{wd2}:holders`);
-      await admin.del(`rwlock:{wd2}:holder_meta`);
+      await admin.del(`rwlock:{wd2}:writer`);
       // wait for the next watchdog tick (~lease/3) to observe the loss
       await settle(500);
       expect(lock.signal.aborted).toBe(true);

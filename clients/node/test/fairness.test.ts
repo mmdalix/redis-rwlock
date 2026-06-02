@@ -48,9 +48,10 @@ function track<T>(p: Promise<T>): { done: boolean; value?: T; err?: unknown } {
 
 async function stateOf(r: string): Promise<{ mode: string; holders: number }> {
   const client = await harness.newClient();
-  const h = (await client.hGetAll(`rwlock:{${r}}:state`)) as Record<string, string>;
-  const holders = Number(await client.zCard(`rwlock:{${r}}:holders`));
-  return { mode: h.mode ?? "none", holders };
+  const readers = Number(await client.zCard(`rwlock:{${r}}:readers`));
+  const writer = Number(await client.exists(`rwlock:{${r}}:writer`));
+  const mode = writer ? "write" : readers > 0 ? "read" : "none";
+  return { mode, holders: readers + writer };
 }
 
 describe("M2 fairness — read_preferring", () => {

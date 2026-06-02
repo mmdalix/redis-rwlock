@@ -17,10 +17,13 @@ design is in [`SPEC.md`](./SPEC.md); the build sequence is in [`PLAN.md`](./PLAN
 
 ## Status
 
-Early development. The shared Lua protocol (`protocol/lua/`) and the **Node.js**
-reference client (`clients/node/`) implement the M0 slice: write locks, queueing,
-hand-off, fencing, crash recovery via self-wake, and `extend`. See `PLAN.md` for the
-milestone roadmap and exactly what is and isn't implemented yet.
+Early development, **protocol v2**. The shared Lua protocol (`protocol/lua/`) and the
+**Node.js** reference client (`clients/node/`) implement read/write locks, FIFO queueing
+with all three fairness policies, immediate hand-off, fencing tokens, the scoped API
+(`withWriteLock`/`withReadLock`, watchdog, `AbortSignal`, `await using`), crash recovery
+(lazy cleanup + self-wake + optional keyspace-event subscriber), Functions-or-EVALSHA
+delivery with a cross-version handshake, and observability (`inspect`, metrics, tracing).
+See `PLAN.md` for the milestone roadmap and `COMPATIBILITY.md` for protocol versions.
 
 ## Repository layout
 
