@@ -16,6 +16,7 @@ local notify_ttl = tonumber(ARGV[2])
 local now = now_ms()
 local rk = req_key(prefix, request_id)
 if redis.call('EXISTS', rk) == 0 then
+  redis.call('ZREM', k.queue, request_id)   -- drop any orphan queue entry left behind
   return { 'GONE' }
 end
 

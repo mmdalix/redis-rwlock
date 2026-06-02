@@ -107,6 +107,23 @@ describe("M4 keyspace subscriber (events DISABLED)", () => {
     await rw.release(h);
   });
 
+  it("recovers from a crashed queued writer (no phantom queued_writers starvation)", async () => {
+    const rw = await mk();
+    const admin = await harness.newClient();
+    const p = "rwlock:{phantom}";
+    // Simulate the post-crash state: a queued writer whose req hash has TTL-expired,
+    // leaving an orphan queue entry and an inflated queued_writers counter.
+    await admin.zAdd(`${p}:queue`, { score: 1, value: "ghost-writer-req" });
+    await admin.hSet(`${p}:state`, { queued_writers: "1", mode: "none" });
+
+    // Before the fix, the reader's fast path saw queued_writers=1, queued, and timed
+    // out forever. After the fix, prune_queue drops the orphan and recomputes it to 0.
+    const h = await rw.acquireRead("phantom", { ownerId: "r1", leaseMs: 30_000, waitMs: 1000 });
+    expect(h.mode).toBe("read");
+    expect((await rw.inspect("phantom")).queuedWriters).toBe(0);
+    await rw.release(h);
+  });
+
   it("respects keyspaceEvents:'off' even when the server supports them", async () => {
     const rw = await mk({ keyspaceEvents: "off" });
     await rw.acquireWrite("k", { ownerId: "w1" }).then((h) => rw.release(h));

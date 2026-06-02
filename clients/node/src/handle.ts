@@ -91,8 +91,13 @@ export class LockHandle implements AsyncDisposable {
     if (this.released) return;
     this.released = true;
     this.stopWatchdog();
-    await this.owner.releaseToken(this.resource, this.token);
-    this.settle("released");
+    try {
+      await this.owner.releaseToken(this.resource, this.token);
+    } finally {
+      // settle even if the release command failed, so the hold span / metrics
+      // never leak; the lease is the ultimate backstop server-side.
+      this.settle("released");
+    }
   }
 
   async [Symbol.asyncDispose](): Promise<void> {

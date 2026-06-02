@@ -75,6 +75,7 @@ export class RwLock {
   private blockingPool?: RedisClientPoolType<any, any, any, any, any>;
   private keyspace?: KeyspaceSubscriber;
   private blockingInUse = 0;
+  private closed = false;
   private readonly owner: HandleOwner;
 
   constructor(client: RedisClientLike, config: RwLockConfig = {}) {
@@ -91,6 +92,7 @@ export class RwLock {
 
   /** Connectivity check, clock-offset learning, and blocking-pool setup — once, lazily. */
   private ensureReady(): Promise<void> {
+    if (this.closed) return Promise.reject(new RwLockError("RwLock has been closed"));
     if (!this.ready) {
       this.ready = (async () => {
         const t = (await this.client.sendCommand(["TIME"])) as [string, string];
@@ -101,10 +103,12 @@ export class RwLock {
         const installed = await installAndHandshake(this.client as unknown as InstallClient, {
           delivery: this.cfg.delivery,
           allowIncompatibleProtocol: this.cfg.allowIncompatibleProtocol,
+          loadedAtMs: serverMs,
         });
         this.delivery = installed.delivery;
         this.moduleInfo = installed.info;
 
+        // Assign before connect() so teardown can close it even if connect fails.
         const pool = createClientPool(this.client.options, {
           maximum: this.cfg.blockingPoolSize,
           acquireTimeout: this.cfg.maxWaitMs,
@@ -112,8 +116,8 @@ export class RwLock {
         pool.on("error", () => {
           /* swallow: surfaced per-call as BackendUnavailableError */
         });
-        await pool.connect();
         this.blockingPool = pool;
+        await pool.connect();
 
         // Optional recovery accelerator: subscribe to keyspace expiry events if the
         // server has them enabled (auto-detected; we never enable them ourselves).
@@ -121,26 +125,50 @@ export class RwLock {
           const sub = new KeyspaceSubscriber(
             () => this.client.duplicate() as unknown as SubscriberConn,
             async (resource) => {
-              await this.delivery!.run("expireAndGrant", [keyPrefix(resource)], [
+              await this.del.run("expireAndGrant", [keyPrefix(resource)], [
                 String(this.cfg.notifyKeyTtlMs),
               ]);
               this.cfg.onRecovery(resource);
             },
           );
           try {
-            await sub.start();
+            await sub.start(); // self-cleans its connection on failure
             this.keyspace = sub;
           } catch {
             /* degrade silently to the self-wake path */
           }
         }
-      })().catch((err) => {
+      })().catch(async (err) => {
+        await this.teardownTransport(); // don't leak a partially-created pool/subscriber
         this.ready = undefined; // allow a later retry
         if (err instanceof RwLockError) throw err; // handshake/capability errors pass through
         throw new BackendUnavailableError("failed to initialise against Redis", { cause: err });
       });
     }
     return this.ready;
+  }
+
+  /** The active delivery once initialised; throws a typed error if closed/uninitialised. */
+  private get del(): Delivery {
+    if (!this.delivery) throw new RwLockError("RwLock is closed or not initialised");
+    return this.delivery;
+  }
+
+  /** Tear down owned connections (blocking pool + keyspace subscriber). */
+  private async teardownTransport(): Promise<void> {
+    const sub = this.keyspace;
+    this.keyspace = undefined;
+    if (sub) await sub.stop().catch(() => {});
+
+    const pool = this.blockingPool;
+    this.blockingPool = undefined;
+    if (pool) {
+      try {
+        await pool.close();
+      } catch {
+        /* already closed */
+      }
+    }
   }
 
   /** Best-effort estimate of the Redis server clock; used only to size timeouts. */
@@ -184,22 +212,12 @@ export class RwLock {
     }
   }
 
-  /** Release the blocking pool and keyspace subscriber. Does NOT touch the user's client. */
+  /** Release the blocking pool and keyspace subscriber. Does NOT touch the user's client.
+   *  Idempotent; after close() further acquire/release calls reject with RwLockError. */
   async close(): Promise<void> {
-    const sub = this.keyspace;
-    this.keyspace = undefined;
-    if (sub) await sub.stop().catch(() => {});
-
-    const pool = this.blockingPool;
-    this.blockingPool = undefined;
+    this.closed = true;
     this.ready = undefined;
-    if (pool) {
-      try {
-        await pool.close();
-      } catch {
-        /* already closed */
-      }
-    }
+    await this.teardownTransport();
   }
 
   acquireWrite(resource: string, opts: AcquireOptions = {}): Promise<LockHandle> {
@@ -277,7 +295,7 @@ export class RwLock {
 
     let res: unknown[];
     try {
-      res = (await this.delivery!.run(
+      res = (await this.del.run(
         "acquire",
         [prefix],
         [
@@ -321,7 +339,7 @@ export class RwLock {
     await this.ensureReady();
     let r: unknown[];
     try {
-      r = (await this.delivery!.run("inspect", [keyPrefix(resource)], [])) as unknown[];
+      r = (await this.del.run("inspect", [keyPrefix(resource)], [])) as unknown[];
     } catch (err) {
       throw new BackendUnavailableError(`inspect failed for ${resource}`, { cause: err });
     }
@@ -365,11 +383,13 @@ export class RwLock {
       let blockMs = Math.max(FLOOR_MS, Math.min(remaining, Math.max(boundary, 0) || remaining));
       if (o.signal) blockMs = Math.min(blockMs, SIGNAL_POLL_MS);
 
+      const pool = this.blockingPool;
+      if (!pool) throw new RwLockError("RwLock was closed during a wait");
       let popped: { key: unknown; element: unknown } | null;
       this.cfg.metrics.gauge("rwlock_blocking_connections_in_use", ++this.blockingInUse);
       try {
         // A dedicated, pooled blocking connection (SPEC §15) — never the user's client.
-        popped = await this.blockingPool!.execute((cli) => cli.blPop(notifyKey, blockMs / 1000));
+        popped = await pool.execute((cli) => cli.blPop(notifyKey, blockMs / 1000));
       } catch (err) {
         throw new BackendUnavailableError(`wait failed for ${resource}`, { cause: err });
       } finally {
@@ -382,7 +402,7 @@ export class RwLock {
       // Woke with no grant -> the holder may have crashed. Run maintenance once
       // (which may push a grant into our mailbox), refresh the boundary, re-block.
       try {
-        await this.delivery!.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
+        await this.del.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
       } catch (err) {
         throw new BackendUnavailableError(`wait maintenance failed for ${resource}`, { cause: err });
       }
@@ -414,7 +434,7 @@ export class RwLock {
   /** Remove our queued request and reconcile a last-instant grant (CANCELLED/RECLAIMED/GONE). */
   private async abortPending(prefix: string, requestId: string): Promise<void> {
     try {
-      await this.delivery!.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
+      await this.del.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
     } catch (err) {
       throw new BackendUnavailableError(`cancel_wait failed`, { cause: err });
     }
@@ -483,7 +503,7 @@ export class RwLock {
   private async releaseToken(resource: string, token: string): Promise<void> {
     await this.ensureReady();
     try {
-      await this.delivery!.run(
+      await this.del.run(
         "release",
         [keyPrefix(resource)],
         [token, String(this.cfg.notifyKeyTtlMs)],
@@ -498,7 +518,7 @@ export class RwLock {
     const lease = this.clampLease(leaseMs);
     let res: unknown[];
     try {
-      res = (await this.delivery!.run("extend", [keyPrefix(resource)], [token, String(lease)])) as unknown[];
+      res = (await this.del.run("extend", [keyPrefix(resource)], [token, String(lease)])) as unknown[];
     } catch (err) {
       throw new BackendUnavailableError(`extend failed for ${resource}`, { cause: err });
     }

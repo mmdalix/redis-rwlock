@@ -22,7 +22,7 @@ local req_ttl_grace   = tonumber(ARGV[9])
 
 local now = now_ms()
 sweep(k, now)
-drop_timed_out_head_requests(k, prefix, now)
+prune_queue(k, prefix, now)
 
 local writer_token   = redis.call('HGET', k.state, 'writer_token')
 local reader_count   = tonumber(redis.call('HGET', k.state, 'reader_count')) or 0

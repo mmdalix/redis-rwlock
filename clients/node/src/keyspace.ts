@@ -45,7 +45,17 @@ export class KeyspaceSubscriber {
       /* swallow: recovery degrades to the self-wake path */
     });
     await conn.connect();
-    await conn.pSubscribe("__keyevent@*__:expired", (message) => this.handle(String(message)));
+    try {
+      await conn.pSubscribe("__keyevent@*__:expired", (message) => this.handle(String(message)));
+    } catch (err) {
+      // pSubscribe denied (e.g. ACL) -> don't leak the connected socket.
+      try {
+        await conn.close();
+      } catch {
+        conn.destroy?.();
+      }
+      throw err;
+    }
     this.conn = conn;
   }
 

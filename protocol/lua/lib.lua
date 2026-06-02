@@ -99,27 +99,32 @@ local function dec_queued_writers(k)
   if qw > 0 then redis.call('HSET', k.state, 'queued_writers', qw - 1) end
 end
 
--- Drop timed-out requests sitting at the head of the queue. Never drops a request
--- that has already been granted (granted_token set) — that is reconciled elsewhere.
-local function drop_timed_out_head_requests(k, prefix, now)
-  while true do
-    local head = redis.call('ZRANGE', k.queue, 0, 0)
-    if #head == 0 then break end
-    local id = head[1]
+-- Prune the queue of orphaned and timed-out requests, and recompute queued_writers
+-- from the surviving LIVE requests (never a request already granted at the buzzer,
+-- which still carries granted_token and is reconciled elsewhere).
+--
+-- queued_writers MUST be derived from the source of truth (the live req hashes),
+-- not maintained as a pure incremental counter: an orphaned queue entry (a waiter
+-- that crashed and whose req hash TTL-expired) cannot report its mode, so an
+-- incremental counter would drift up permanently on a crashed queued writer and —
+-- under write_preferring — starve every subsequent reader forever.
+local function prune_queue(k, prefix, now)
+  local members = redis.call('ZRANGE', k.queue, 0, -1)
+  local writers = 0
+  for _, id in ipairs(members) do
     local rk = req_key(prefix, id)
     local wd = redis.call('HGET', rk, 'wait_deadline_ms')
     local gt = redis.call('HGET', rk, 'granted_token')
     if is_blank(wd) then
-      -- req hash gone (TTL expired) but an orphan queue entry remains: clean it.
-      redis.call('ZREM', k.queue, id)
+      redis.call('ZREM', k.queue, id)                          -- orphan: req hash gone
     elseif tonumber(wd) <= now and is_blank(gt) then
       redis.call('ZREM', k.queue, id)
-      if redis.call('HGET', rk, 'mode') == 'write' then dec_queued_writers(k) end
-      redis.call('DEL', rk)
-    else
-      break
+      redis.call('DEL', rk)                                    -- timed out, not granted
+    elseif redis.call('HGET', rk, 'mode') == 'write' then
+      writers = writers + 1
     end
   end
+  redis.call('HSET', k.state, 'queued_writers', writers)
 end
 
 local function push_grant(prefix, req_id, token, fencing, expire_at, mode, notify_key_ttl_ms)
@@ -216,7 +221,7 @@ end
 -- resource namespace).
 local function grant_from_queue(k, prefix, now, notify_key_ttl_ms)
   sweep(k, now)
-  drop_timed_out_head_requests(k, prefix, now)
+  prune_queue(k, prefix, now)
 
   local writer_token = redis.call('HGET', k.state, 'writer_token')
   if not is_blank(writer_token) then return 0 end          -- a writer holds -> nobody else

@@ -49,7 +49,7 @@ export interface InstallResult {
 
 export async function installAndHandshake(
   client: InstallClient,
-  opts: { delivery: DeliveryPreference; allowIncompatibleProtocol: boolean },
+  opts: { delivery: DeliveryPreference; allowIncompatibleProtocol: boolean; loadedAtMs: number },
 ): Promise<InstallResult> {
   const marker = await readMarker(client);
   if (marker) {
@@ -78,7 +78,7 @@ export async function installAndHandshake(
       protocol_version: String(PROTOCOL_VERSION),
       impl_version: IMPL_VERSION,
       sha: MODULE_SHA,
-      loaded_at_ms: String(Date.now()),
+      loaded_at_ms: String(opts.loadedAtMs), // Redis server time (SPEC §5), not client clock
     });
   }
 
