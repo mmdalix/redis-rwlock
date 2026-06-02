@@ -101,7 +101,7 @@ describe("M4 keyspace subscriber (events DISABLED)", () => {
     const rw = await mk();
     // A crashed READER lives in a ZSET with no native TTL, so without events or any
     // other op it lingers past its lease. (A crashed WRITER, by contrast, self-expires
-    // via its key TTL — a v2 improvement, exercised by the events-enabled suite.)
+    // via its key TTL — exercised by the events-enabled suite.)
     await rw.acquireRead("orphan", { ownerId: "r1", leaseMs: 300 });
     await settle(900);
     expect(await holderCount(harness, "orphan")).toBe(1);
@@ -116,7 +116,7 @@ describe("M4 keyspace subscriber (events DISABLED)", () => {
     const admin = await harness.newClient();
     const p = "rwlock:{phantom}";
     // Simulate the post-crash state: a queued writer whose req hash has TTL-expired,
-    // leaving an orphan queue entry. (v2 derives queued_writers from live req hashes,
+    // leaving an orphan queue entry. (queued_writers is derived from live req hashes,
     // so there is no separate counter to inflate — the orphan itself is the hazard.)
     await admin.zAdd(`${p}:queue`, { score: 1, value: "ghost-writer-req" });
 

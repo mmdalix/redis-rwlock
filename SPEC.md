@@ -1,7 +1,7 @@
 # Distributed Read/Write Lock over Redis — Implementation Specification
 
 **Status:** Ready for implementation
-**Version:** Spec v2.0 · targets wire/protocol `PROTOCOL_VERSION = 2`
+**Version:** Spec v1.0 · targets wire/protocol `PROTOCOL_VERSION = 1`
 **Audience:** Engineers (or coding agents) building the library in Node.js, Python, Go, Java, etc.
 **Deliverable being specified:** a *client library*, published to npm / PyPI / Go modules / Maven, that talks to a Redis the **user already runs**. No server, daemon, or sidecar that we operate. It must work the moment a user installs it and points it at their Redis.
 
@@ -153,7 +153,7 @@ Plus one global key, written once when the script module is installed:
 rwlock:__module__         HASH    { protocol_version, impl_version, sha, loaded_at_ms }
 ```
 
-### 4.1 State is DERIVED, not cached (v2)
+### 4.1 State is DERIVED, not cached
 
 There is **no denormalized state cache and no per-holder metadata**. Lock state is computed O(1) directly from the source-of-truth structures, so it cannot drift:
 
@@ -463,7 +463,7 @@ When enabled, a client-side timer refreshes the lease at roughly `lease_ms / 3` 
 
 ### 9.4 Reentrancy (optional extension, default off)
 
-To support the same `owner_id` re-acquiring, maintain a per-owner refcount and have release decrement rather than remove until zero. Any added fields are a `PROTOCOL_VERSION` bump and must be specified before use. Keep it clearly flagged and off by default; v2 cores may omit it. Matches Go's non-reentrant `sync.RWMutex` when off.
+To support the same `owner_id` re-acquiring, maintain a per-owner refcount and have release decrement rather than remove until zero. Any added fields are a `PROTOCOL_VERSION` bump and must be specified before use. Keep it clearly flagged and off by default; v1 cores may omit it. Matches Go's non-reentrant `sync.RWMutex` when off.
 
 ---
 
@@ -623,9 +623,9 @@ If a deployment is connection-constrained but watches many locks, an optional al
 
 Once published you cannot recall a release, and **mixed client versions will contend on the same locks in the same Redis** (one service upgrades before another). So:
 
-- The Lua/Functions module embeds `PROTOCOL_VERSION` (a **single integer**, currently **2**) and writes `rwlock:__module__ = { protocol_version, impl_version, sha, loaded_at_ms }` when installed. `loaded_at_ms` is Redis server time (§5); `impl_version` is informational and never used in compatibility decisions.
+- The Lua/Functions module embeds `PROTOCOL_VERSION` (a **single integer**, currently **1**) and writes `rwlock:__module__ = { protocol_version, impl_version, sha, loaded_at_ms }` when installed. `loaded_at_ms` is Redis server time (§5); `impl_version` is informational and never used in compatibility decisions.
 - **Compatibility is exact-integer equality** on `protocol_version`. On connect the client reads `rwlock:__module__`; if it exists and its `protocol_version` differs from the client's, the client raises `IncompatibleServerLogic` rather than silently contending under foreign semantics. (A config flag may allow coexistence only when explicitly opted into.) There is no major/minor split — every protocol change bumps the integer and is mutually incompatible by construction.
-- **Any change to the wire protocol, key schema, script return contracts, or grant semantics bumps `PROTOCOL_VERSION`.** Clients with the same `PROTOCOL_VERSION` are guaranteed identical semantics and are safe to contend; different versions must not share a resource namespace. (v1 → v2 changed the key schema and grant algorithm; they are incompatible.)
+- **Any change to the wire protocol, key schema, script return contracts, or grant semantics bumps `PROTOCOL_VERSION`.** Clients with the same `PROTOCOL_VERSION` are guaranteed identical semantics and are safe to contend; different versions must not share a resource namespace.
 - **Install algorithm (normative).** On connect: (1) attempt `FUNCTION LOAD REPLACE <library>` (idempotent; on failure fall back to `SCRIPT LOAD`/`EVALSHA` — Section 17); (2) read `rwlock:__module__`; if absent, `HSET` it. `FUNCTION LOAD REPLACE` and the marker write are each individually idempotent and safe under concurrent installers (all write identical values). If a crash leaves the module loaded but the marker absent, the next client simply writes the marker. The client must never assume the marker's presence implies its *own* version is loaded — it always (re)loads its library, then checks the marker for an incompatible peer.
 
 Document the cross-version contention guarantee explicitly in the README.
@@ -794,7 +794,7 @@ Implement the **reference language first** (recommend Node.js or Python for fast
 
 ## Appendix A: full script pseudocode
 
-> Pseudocode, not drop-in Lua, but precise about ordering and effects (v2). `now = redis.TIME()` at the top of each mutating script. `KEYS[1]` is the prefix `rwlock:{r}`; all keys are derived from it. State is **derived from truth** (`readers`/`writer`/`queue`), never cached.
+> Pseudocode, not drop-in Lua, but precise about ordering and effects. `now = redis.TIME()` at the top of each mutating script. `KEYS[1]` is the prefix `rwlock:{r}`; all keys are derived from it. State is **derived from truth** (`readers`/`writer`/`queue`), never cached.
 
 ### A.1 Shared helpers
 
@@ -988,7 +988,7 @@ Token grammar (§5): `"<owner_id>:<request_id>:<fencing>"`, e.g. `"worker-1:01J9
 
 **Module marker** (`rwlock:__module__`, written on install). `loaded_at_ms` is Redis server time; `impl_version` is informational (not used for compatibility):
 ```json
-{ "protocol_version": 2, "impl_version": "0.0.0", "sha": "<function-library-sha1>",
+{ "protocol_version": 1, "impl_version": "0.0.0", "sha": "<function-library-sha1>",
   "loaded_at_ms": 1760000000000 }
 ```
 

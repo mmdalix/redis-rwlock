@@ -17,7 +17,7 @@ design is in [`SPEC.md`](./SPEC.md); the build sequence is in [`PLAN.md`](./PLAN
 
 ## Status
 
-Early development, **protocol v2**. The shared Lua protocol (`protocol/lua/`) and the
+Early development (`PROTOCOL_VERSION 1`, unreleased). The shared Lua protocol (`protocol/lua/`) and the
 **Node.js** reference client (`clients/node/`) implement read/write locks, FIFO queueing
 with all three fairness policies, immediate hand-off, fencing tokens, the scoped API
 (`withWriteLock`/`withReadLock`, watchdog, `AbortSignal`, `await using`), crash recovery

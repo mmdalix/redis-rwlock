@@ -1,9 +1,9 @@
--- lib.lua — shared helpers for all redis-rwlock scripts (PROTOCOL_VERSION 2).
+-- lib.lua — shared helpers for all redis-rwlock scripts (PROTOCOL_VERSION 1).
 --
 -- This file is prepended to each script for the EVALSHA path and wrapped into the
 -- Redis FUNCTION library; either way it is the single source of truth.
 --
--- DESIGN (v2): state is DERIVED from source-of-truth structures, never cached.
+-- DESIGN: state is DERIVED from source-of-truth structures, never cached.
 --   * readers : ZSET  member=reader token, score=expire_at_ms
 --   * writer  : HASH  { token, expire_at_ms }  (the single writer; PEXPIRE'd to the
 --               lease so a crashed writer fires a native keyspace `expired` event)

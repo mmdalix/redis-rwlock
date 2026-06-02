@@ -2,10 +2,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from
 import { RwLock, type RwLockConfig } from "../src/index.js";
 import { startRedis, type RedisHarness } from "./redis-harness.js";
 
-// Regression tests for the v2 redesign / review findings:
+// Regression tests for the protocol-redesign review findings:
 //   F3 — a reader behind a crashed queued writer self-wakes at the writer's deadline.
 //   F6 — extend never shortens the lease.
-//   v2 — a crashed writer self-expires via its key TTL (no library action needed).
+//   crashed writer self-expires via its key TTL (no library action needed).
 
 let harness: RedisHarness;
 const locks: RwLock[] = [];
@@ -37,7 +37,7 @@ async function holders(r: string): Promise<number> {
   return readers + writer;
 }
 
-describe("v2 regressions", () => {
+describe("protocol regressions", () => {
   it("F6: extend never moves the expiry earlier", async () => {
     const rw = await mk();
     const h = await rw.acquireWrite("f6", { ownerId: "w1", leaseMs: 30_000 });
@@ -48,7 +48,7 @@ describe("v2 regressions", () => {
     await rw.release(h);
   });
 
-  it("v2: a crashed writer self-expires via its key TTL with no library action", async () => {
+  it("a crashed writer self-expires via its key TTL with no library action", async () => {
     const rw = await mk(); // events disabled on this harness; no subscriber, no other ops
     await rw.acquireWrite("selfexp", { ownerId: "w1", leaseMs: 300 });
     expect(await holders("selfexp")).toBe(1);
