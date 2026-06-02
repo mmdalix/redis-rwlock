@@ -34,15 +34,28 @@ export class LockHandle implements AsyncDisposable {
   private readonly owner: HandleOwner;
   private readonly ac = new AbortController();
   private released = false;
+  private settled = false;
   private watchdogTimer?: ReturnType<typeof setInterval>;
+  private readonly onSettle: (result: "released" | "lost") => void;
 
-  constructor(owner: HandleOwner, data: LockHandleData) {
+  constructor(
+    owner: HandleOwner,
+    data: LockHandleData,
+    onSettle: (result: "released" | "lost") => void = () => {},
+  ) {
     this.owner = owner;
     this.resource = data.resource;
     this.mode = data.mode;
     this.token = data.token;
     this.fencingToken = data.fencingToken;
     this.leaseUntilMs = data.leaseUntilMs;
+    this.onSettle = onSettle;
+  }
+
+  private settle(result: "released" | "lost"): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.onSettle(result);
   }
 
   /** Aborts the instant the lock is lost (its `reason` is a LockLostError). Stays
@@ -79,6 +92,7 @@ export class LockHandle implements AsyncDisposable {
     this.released = true;
     this.stopWatchdog();
     await this.owner.releaseToken(this.resource, this.token);
+    this.settle("released");
   }
 
   async [Symbol.asyncDispose](): Promise<void> {
@@ -113,5 +127,6 @@ export class LockHandle implements AsyncDisposable {
     this.released = true;
     this.stopWatchdog();
     if (!this.ac.signal.aborted) this.ac.abort(err);
+    this.settle("lost");
   }
 }

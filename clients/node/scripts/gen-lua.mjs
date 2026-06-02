@@ -19,7 +19,7 @@ const luaDir = resolve(here, "../../../protocol/lua");
 const versionFile = resolve(here, "../../../protocol/VERSION");
 const outFile = resolve(here, "../src/lua.generated.ts");
 
-const SCRIPTS = ["acquire", "release", "extend", "cancel_wait", "expire_and_grant"];
+const SCRIPTS = ["acquire", "release", "extend", "cancel_wait", "expire_and_grant", "inspect"];
 
 const camel = (s) => s.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 
@@ -34,11 +34,14 @@ const scriptEntries = SCRIPTS.map(
 
 // Functions library: lib once, then a registered function per body. Each callback
 // binds KEYS/ARGV from (keys, args) so the unmodified body works verbatim.
-const wrappers = SCRIPTS.map(
-  (name) =>
-    `redis.register_function('rwlock_${name}', function(keys, args)\n` +
-    `  local KEYS, ARGV = keys, args\n${bodies[name]}\nend)`,
-).join("\n\n");
+const wrappers = SCRIPTS.map((name) => {
+  const callback = `function(keys, args)\n  local KEYS, ARGV = keys, args\n${bodies[name]}\nend`;
+  // inspect is read-only -> register with the no-writes flag so it can run on replicas.
+  if (name === "inspect") {
+    return `redis.register_function{ function_name = 'rwlock_inspect', flags = { 'no-writes' }, callback = ${callback} }`;
+  }
+  return `redis.register_function('rwlock_${name}', ${callback})`;
+}).join("\n\n");
 const functionLib = `#!lua name=rwlock\n${lib}\n${wrappers}\n`;
 
 const out =

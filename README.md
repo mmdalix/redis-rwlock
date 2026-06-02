@@ -58,6 +58,22 @@ await using lock = await rw.acquireWrite("order:123", { ownerId: "worker-1" });
 // released automatically at end of scope
 ```
 
+## Observability
+
+Pass pluggable `metrics` / `tracer` sinks (adapt to prom-client, OpenTelemetry,
+StatsD, …) and inspect any resource:
+
+```ts
+const rw = new RwLock(client, { metrics, tracer });
+const status = await rw.inspect("order:123");
+// { mode, readerCount, writerActive, queueLength, queuedWriters, oldestWaitMs, nextExpiryMs }
+```
+
+Metrics emitted include `rwlock_acquire_total{mode,result}`, `rwlock_wait_duration_ms`,
+`rwlock_held_duration_ms`, `rwlock_timeouts_total`, `rwlock_extend_total{result}`,
+`rwlock_release_total`, `rwlock_lock_lost_total`, `rwlock_fencing_token_current`, and
+`rwlock_blocking_connections_in_use` (also on `rw.blockingConnectionsInUse`).
+
 ## Development
 
 ```bash

@@ -13,8 +13,14 @@ export {
 } from "./errors.js";
 export {
   DEFAULTS,
+  NOOP_METRICS,
+  NOOP_TRACER,
   type AcquireOptions,
   type Fairness,
   type LockMode,
+  type Metrics,
+  type ResourceStatus,
   type RwLockConfig,
+  type Span,
+  type Tracer,
 } from "./types.js";

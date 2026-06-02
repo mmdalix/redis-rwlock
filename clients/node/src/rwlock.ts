@@ -10,6 +10,7 @@ import {
   type AcquireOptions,
   type Fairness,
   type LockMode,
+  type ResourceStatus,
   type RwLockConfig,
 } from "./types.js";
 
@@ -73,6 +74,7 @@ export class RwLock {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private blockingPool?: RedisClientPoolType<any, any, any, any, any>;
   private keyspace?: KeyspaceSubscriber;
+  private blockingInUse = 0;
   private readonly owner: HandleOwner;
 
   constructor(client: RedisClientLike, config: RwLockConfig = {}) {
@@ -161,6 +163,11 @@ export class RwLock {
     return this.moduleInfo;
   }
 
+  /** Number of blocking BLPOP connections currently in use (SPEC §15, §18 gauge). */
+  get blockingConnectionsInUse(): number {
+    return this.blockingInUse;
+  }
+
   /** Read the server's notify-keyspace-events flags; true iff expired keyevents fire. */
   private async detectKeyspaceEvents(): Promise<boolean> {
     try {
@@ -236,6 +243,32 @@ export class RwLock {
   }
 
   async acquire(resource: string, mode: LockMode, opts: AcquireOptions = {}): Promise<LockHandle> {
+    const span = this.cfg.tracer.startSpan("rwlock.acquire", { resource, mode });
+    const t0 = Date.now();
+    try {
+      const handle = await this.doAcquire(resource, mode, opts);
+      this.cfg.metrics.observe("rwlock_wait_duration_ms", Date.now() - t0, { mode });
+      this.cfg.metrics.increment("rwlock_acquire_total", { mode, result: "granted" });
+      this.cfg.metrics.gauge("rwlock_fencing_token_current", handle.fencingToken, { resource });
+      span.setAttribute("fencingToken", handle.fencingToken);
+      span.setStatus(true);
+      return handle;
+    } catch (err) {
+      if (err instanceof WaitTimeoutError) {
+        this.cfg.metrics.increment("rwlock_acquire_total", { mode, result: "timeout" });
+        this.cfg.metrics.increment("rwlock_timeouts_total", { mode });
+      } else {
+        this.cfg.metrics.increment("rwlock_acquire_total", { mode, result: "error" });
+      }
+      span.recordException(err);
+      span.setStatus(false);
+      throw err;
+    } finally {
+      span.end();
+    }
+  }
+
+  private async doAcquire(resource: string, mode: LockMode, opts: AcquireOptions): Promise<LockHandle> {
     if (opts.signal?.aborted) throw abortError(opts.signal);
     await this.ensureReady();
     const o = this.resolveOptions(opts);
@@ -283,6 +316,29 @@ export class RwLock {
     return this.waitForGrant(resource, prefix, requestId, notifyKey, waitDeadlineMs, headHolderLeaseMs, o);
   }
 
+  /** Read-only debug snapshot of a resource (SPEC §18). */
+  async inspect(resource: string): Promise<ResourceStatus> {
+    await this.ensureReady();
+    let r: unknown[];
+    try {
+      r = (await this.delivery!.run("inspect", [keyPrefix(resource)], [])) as unknown[];
+    } catch (err) {
+      throw new BackendUnavailableError(`inspect failed for ${resource}`, { cause: err });
+    }
+    const status: ResourceStatus = {
+      mode: String(r[0]) as ResourceStatus["mode"],
+      readerCount: Number(r[1]),
+      writerActive: Number(r[2]) === 1,
+      queueLength: Number(r[3]),
+      queuedWriters: Number(r[4]),
+      oldestWaitMs: Number(r[5]),
+      nextExpiryMs: Number(r[6]),
+    };
+    this.cfg.metrics.gauge("rwlock_queue_length", status.queueLength, { resource });
+    this.cfg.metrics.gauge("rwlock_queued_writers", status.queuedWriters, { resource });
+    return status;
+  }
+
   private async waitForGrant(
     resource: string,
     prefix: string,
@@ -310,11 +366,14 @@ export class RwLock {
       if (o.signal) blockMs = Math.min(blockMs, SIGNAL_POLL_MS);
 
       let popped: { key: unknown; element: unknown } | null;
+      this.cfg.metrics.gauge("rwlock_blocking_connections_in_use", ++this.blockingInUse);
       try {
         // A dedicated, pooled blocking connection (SPEC §15) — never the user's client.
         popped = await this.blockingPool!.execute((cli) => cli.blPop(notifyKey, blockMs / 1000));
       } catch (err) {
         throw new BackendUnavailableError(`wait failed for ${resource}`, { cause: err });
+      } finally {
+        this.cfg.metrics.gauge("rwlock_blocking_connections_in_use", --this.blockingInUse);
       }
       if (popped) {
         return this.handleFromPayload(resource, String(popped.element), o);
@@ -388,7 +447,23 @@ export class RwLock {
     data: { resource: string; mode: LockMode; token: string; fencingToken: number; leaseUntilMs: number },
     o: ResolvedOptions,
   ): LockHandle {
-    const handle = new LockHandle(this.owner, data);
+    const acquiredAt = Date.now();
+    const holdSpan = this.cfg.tracer.startSpan("rwlock.hold", {
+      resource: data.resource,
+      mode: data.mode,
+      fencingToken: data.fencingToken,
+    });
+    const onSettle = (result: "released" | "lost"): void => {
+      this.cfg.metrics.observe("rwlock_held_duration_ms", Date.now() - acquiredAt, { mode: data.mode });
+      if (result === "released") {
+        this.cfg.metrics.increment("rwlock_release_total", { result: "ok" });
+      } else {
+        this.cfg.metrics.increment("rwlock_lock_lost_total", { mode: data.mode });
+      }
+      holdSpan.setStatus(result === "released");
+      holdSpan.end();
+    };
+    const handle = new LockHandle(this.owner, data, onSettle);
     if (o.watchdog) handle.startWatchdog(o.leaseMs);
     return handle;
   }
@@ -428,8 +503,10 @@ export class RwLock {
       throw new BackendUnavailableError(`extend failed for ${resource}`, { cause: err });
     }
     if (String(res[0]) === "LOST") {
+      this.cfg.metrics.increment("rwlock_extend_total", { result: "lost" });
       throw new LockLostError(`lock lost for ${resource}`);
     }
+    this.cfg.metrics.increment("rwlock_extend_total", { result: "ok" });
     return Number(res[1]);
   }
 

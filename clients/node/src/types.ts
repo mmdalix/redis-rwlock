@@ -21,6 +21,48 @@ export interface AcquireOptions {
   signal?: AbortSignal;
 }
 
+/** Debug snapshot of a resource (SPEC §18), from inspect(). */
+export interface ResourceStatus {
+  mode: "none" | "read" | "write";
+  readerCount: number;
+  writerActive: boolean;
+  queueLength: number;
+  queuedWriters: number;
+  /** How long the oldest waiter has waited, ms (-1 if no waiters). */
+  oldestWaitMs: number;
+  /** Time until the soonest holder lease expires, ms (-1 if no holders). */
+  nextExpiryMs: number;
+}
+
+/** Metrics sink (SPEC §18). Adapt to prom-client / OpenTelemetry / StatsD, etc. */
+export interface Metrics {
+  increment(name: string, labels?: Record<string, string | number>): void;
+  observe(name: string, value: number, labels?: Record<string, string | number>): void;
+  gauge(name: string, value: number, labels?: Record<string, string | number>): void;
+}
+
+/** Minimal span, shaped to map cleanly onto an OpenTelemetry Span. */
+export interface Span {
+  setAttribute(key: string, value: string | number | boolean): void;
+  recordException(error: unknown): void;
+  setStatus(ok: boolean): void;
+  end(): void;
+}
+
+/** Tracer sink (SPEC §18). Adapt to OpenTelemetry, etc. */
+export interface Tracer {
+  startSpan(name: string, attributes?: Record<string, string | number | boolean>): Span;
+}
+
+export const NOOP_SPAN: Span = {
+  setAttribute() {},
+  recordException() {},
+  setStatus() {},
+  end() {},
+};
+export const NOOP_METRICS: Metrics = { increment() {}, observe() {}, gauge() {} };
+export const NOOP_TRACER: Tracer = { startSpan: () => NOOP_SPAN };
+
 /** Tunables for the RwLock instance. All optional; sensible defaults per Spec §19. */
 export interface RwLockConfig {
   defaultLeaseMs?: number;
@@ -48,6 +90,10 @@ export interface RwLockConfig {
   /** Contend even if the server's protocol MAJOR differs from this client (SPEC §16).
    *  Default false — a mismatch raises IncompatibleServerLogicError. */
   allowIncompatibleProtocol?: boolean;
+  /** Metrics sink (SPEC §18). Default: no-op. */
+  metrics?: Metrics;
+  /** Tracer sink (SPEC §18). Default: no-op. */
+  tracer?: Tracer;
 }
 
 export const DEFAULTS = {
@@ -66,4 +112,6 @@ export const DEFAULTS = {
   onRecovery: (_resource: string): void => {},
   delivery: "auto" as "auto" | "functions" | "scripts",
   allowIncompatibleProtocol: false,
+  metrics: NOOP_METRICS,
+  tracer: NOOP_TRACER,
 } as const;

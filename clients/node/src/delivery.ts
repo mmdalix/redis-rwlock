@@ -23,6 +23,7 @@ const FN_NAME: Record<ScriptName, string> = {
   extend: "rwlock_extend",
   cancelWait: "rwlock_cancel_wait",
   expireAndGrant: "rwlock_expire_and_grant",
+  inspect: "rwlock_inspect",
 };
 
 function isNoScript(err: unknown): boolean {
