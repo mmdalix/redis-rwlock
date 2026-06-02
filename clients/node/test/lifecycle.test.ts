@@ -44,6 +44,17 @@ describe("RwLock lifecycle", () => {
     await expect(rw.close()).resolves.toBeUndefined();
   });
 
+  it("close() racing first-time init settles cleanly and leaves the lock closed", async () => {
+    const rw = new RwLock(await harness.newClient());
+    locks.push(rw);
+    // close() races the in-flight ensureReady() kicked off by the first acquire; it must
+    // not hang or throw a raw TypeError, and the instance must end up closed.
+    const acq = rw.acquireWrite("init-race", { ownerId: "w1", waitMs: 500 }).catch((e: unknown) => e);
+    await rw.close();
+    await acq; // must settle, not hang
+    await expect(rw.acquireWrite("init-race", { ownerId: "w2" })).rejects.toBeInstanceOf(RwLockError);
+  });
+
   it("recovers after an init failure (ready is cleared, no wedged state)", async () => {
     // A client pointed at a dead port: first acquire fails closed, and because
     // ensureReady tears down partial state and clears `ready`, the instance is reusable.

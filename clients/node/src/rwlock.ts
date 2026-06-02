@@ -216,7 +216,17 @@ export class RwLock {
    *  Idempotent; after close() further acquire/release calls reject with RwLockError. */
   async close(): Promise<void> {
     this.closed = true;
+    // Let an in-flight init finish assigning the pool/subscriber before we tear them
+    // down, so a close() that races first-time init cannot orphan those connections.
+    const pending = this.ready;
     this.ready = undefined;
+    if (pending) {
+      try {
+        await pending;
+      } catch {
+        /* init failed; it already tore down its own partial state */
+      }
+    }
     await this.teardownTransport();
   }
 
@@ -379,8 +389,16 @@ export class RwLock {
       // Block until the soonest interesting event (a holder lease boundary or the head
       // request's deadline — to catch a crash) or our own deadline, re-checking a cancel
       // signal at least every SIGNAL_POLL_MS.
-      const boundary = nextWakeMs > 0 ? nextWakeMs - this.serverNow() + EPSILON_MS : remaining;
-      let blockMs = Math.max(FLOOR_MS, Math.min(remaining, Math.max(boundary, 0) || remaining));
+      // Wake at the next interesting boundary (a holder lease or the head request's
+      // deadline) or our own deadline. If a boundary exists but has already passed,
+      // wake almost immediately (FLOOR_MS) to run maintenance — NOT the full wait.
+      let blockMs: number;
+      if (nextWakeMs > 0) {
+        blockMs = Math.min(remaining, Math.max(FLOOR_MS, nextWakeMs - this.serverNow() + EPSILON_MS));
+      } else {
+        blockMs = remaining; // no boundary -> block until our own deadline
+      }
+      blockMs = Math.max(FLOOR_MS, blockMs);
       if (o.signal) blockMs = Math.min(blockMs, SIGNAL_POLL_MS);
 
       const pool = this.blockingPool;

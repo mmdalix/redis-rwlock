@@ -1,8 +1,10 @@
 // Optional, auto-detected keyspace-expiry subscriber (SPEC §10.3). When the user's
 // Redis has `notify-keyspace-events` including expired keyevents, we run one extra
-// connection subscribed to `__keyevent@*__:expired`. When a per-resource lease
-// sentinel (rwlock:{r}:lease_expiry) expires, we run expire_and_grant(r) — promptly
-// reclaiming a crashed holder out-of-band, without any per-waiter self-wake roundtrip.
+// connection subscribed to `__keyevent@*__:expired`. A crashed writer's `writer` key
+// is PEXPIRE'd to its lease, so its native expiry fires an event; on any rwlock:{r}:*
+// key expiry we run expire_and_grant(r) — promptly reclaiming/granting out-of-band,
+// without a per-waiter self-wake roundtrip. (Readers live in a ZSET with no native
+// TTL and are recovered by self-wake instead.)
 // We NEVER call CONFIG SET; if events are off, the self-wake path (SPEC §10.2) covers it.
 
 /** Minimal structural view of a node-redis connection used for pub/sub. */
@@ -15,7 +17,7 @@ export interface SubscriberConn {
 }
 
 // Matches any rwlock key and captures the resource between the hash-tag braces:
-// e.g. "rwlock:{order:123}:lease_expiry" -> "order:123".
+// e.g. "rwlock:{order:123}:writer" -> "order:123".
 const RESOURCE_RE = /^rwlock:\{(.+)\}:/;
 
 export function parseResource(key: string): string | undefined {

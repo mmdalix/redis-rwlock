@@ -763,7 +763,7 @@ Maintain a **language-agnostic scenario file** plus the shared Lua. The normativ
 Implement the **reference language first** (recommend Node.js or Python for fastest iteration; Go is an easy port after). Each milestone ends with its slice of the Section 20 tests green.
 
 - **M0** Single-node **write lock**: `acquire`/`release`, lease, token verification, fencing, `BLPOP` mailbox, fail-closed, server `TIME`.
-- **M1** **Read locks** + `grant_contiguous_readers` batching + `state` cache.
+- **M1** **Read locks** + `grant_contiguous_readers` batching + derived state (`readers`/`writer`).
 - **M2** FIFO **queue** (ZSET-by-seq) + `fairness` policies + `cancel_wait` (incl. ghost-grant reconciliation).
 - **M3** `extend` + safety margin + opt-in **watchdog** + scoped API with cancellation.
 - **M4** **Recovery**: lazy cleanup + self-wake + optional keyspace-event subscriber (`expire_and_grant`).
