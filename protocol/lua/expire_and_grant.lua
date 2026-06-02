@@ -15,4 +15,5 @@ local notify_ttl = tonumber(ARGV[1])
 
 local now = now_ms()
 local granted = grant_from_queue(k, prefix, now, notify_ttl)   -- sweep + drop happen inside
+arm_lease_sentinel(k, now)
 return { 'OK', granted }

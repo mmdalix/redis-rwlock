@@ -22,12 +22,17 @@ end
 -- Derive the fixed per-resource keys from the prefix in KEYS[1].
 local function keys_for(prefix)
   return {
-    state       = prefix .. ':state',
-    holders     = prefix .. ':holders',
-    holder_meta = prefix .. ':holder_meta',
-    queue       = prefix .. ':queue',
-    seq         = prefix .. ':seq',
-    fence       = prefix .. ':fence',
+    state        = prefix .. ':state',
+    holders      = prefix .. ':holders',
+    holder_meta  = prefix .. ':holder_meta',
+    queue        = prefix .. ':queue',
+    seq          = prefix .. ':seq',
+    fence        = prefix .. ':fence',
+    -- A TTL'd sentinel mirroring the soonest holder lease expiry. Its only purpose
+    -- is to make holder-lease expiry observable via Redis keyspace notifications
+    -- (holders live in a ZSET by score and otherwise fire no expired event). The
+    -- core grant logic never reads it; it is an opt-in recovery accelerator (§10.3).
+    lease_expiry = prefix .. ':lease_expiry',
   }
 end
 
@@ -36,6 +41,19 @@ local function notify_key(prefix, id) return prefix .. ':notify:' .. id end
 
 local function is_blank(v)
   return v == nil or v == false or v == ''
+end
+
+-- Arm (or clear) the lease-expiry sentinel to fire a keyspace `expired` event at the
+-- soonest current holder's lease boundary. Called at the end of every mutating script.
+local function arm_lease_sentinel(k, now)
+  local mn = redis.call('ZRANGE', k.holders, 0, 0, 'WITHSCORES')
+  if #mn >= 2 then
+    local ms = tonumber(mn[2]) - now
+    if ms < 1 then ms = 1 end
+    redis.call('SET', k.lease_expiry, '1', 'PX', ms)
+  else
+    redis.call('DEL', k.lease_expiry)
+  end
 end
 
 -- Recompute mode / writer_token / reader_count from the holders ZSET. Does NOT

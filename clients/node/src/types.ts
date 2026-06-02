@@ -36,6 +36,12 @@ export interface RwLockConfig {
   blockingPoolSize?: number;
   /** Refuse to extend within this margin of expiry (SPEC §9.2). Default 500ms. */
   extensionMarginMs?: number;
+  /** Use the keyspace-expiry subscriber if the server has it enabled (SPEC §10.3,
+   *  §17). "auto" detects via CONFIG GET (never CONFIG SET); "off" disables it.
+   *  Default "auto". Falls back silently to the per-waiter self-wake path. */
+  keyspaceEvents?: "auto" | "off";
+  /** Invoked after a recovery sweep triggered by a keyspace-expiry event. */
+  onRecovery?: (resource: string) => void;
 }
 
 export const DEFAULTS = {
@@ -50,4 +56,6 @@ export const DEFAULTS = {
   requireOwnerId: true,
   blockingPoolSize: 16,
   extensionMarginMs: 500,
+  keyspaceEvents: "auto" as "auto" | "off",
+  onRecovery: (_resource: string): void => {},
 } as const;

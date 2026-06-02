@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createClientPool, type RedisClientPoolType, type RedisClientType } from "redis";
 import { ScriptRunner } from "./scripts.js";
 import { LockHandle, type HandleOwner } from "./handle.js";
+import { KeyspaceSubscriber, type SubscriberConn } from "./keyspace.js";
 import { BackendUnavailableError, LockLostError, WaitTimeoutError } from "./errors.js";
 import {
   DEFAULTS,
@@ -68,6 +69,7 @@ export class RwLock {
   // Dedicated pool for blocking BLPOP waits so we never tie up the user's client (SPEC §15).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private blockingPool?: RedisClientPoolType<any, any, any, any, any>;
+  private keyspace?: KeyspaceSubscriber;
   private readonly owner: HandleOwner;
 
   constructor(client: RedisClientLike, config: RwLockConfig = {}) {
@@ -100,6 +102,26 @@ export class RwLock {
         });
         await pool.connect();
         this.blockingPool = pool;
+
+        // Optional recovery accelerator: subscribe to keyspace expiry events if the
+        // server has them enabled (auto-detected; we never enable them ourselves).
+        if (this.cfg.keyspaceEvents !== "off" && (await this.detectKeyspaceEvents())) {
+          const sub = new KeyspaceSubscriber(
+            () => this.client.duplicate() as unknown as SubscriberConn,
+            async (resource) => {
+              await this.scripts.run("expireAndGrant", [keyPrefix(resource)], [
+                String(this.cfg.notifyKeyTtlMs),
+              ]);
+              this.cfg.onRecovery(resource);
+            },
+          );
+          try {
+            await sub.start();
+            this.keyspace = sub;
+          } catch {
+            /* degrade silently to the self-wake path */
+          }
+        }
       })().catch((err) => {
         this.ready = undefined; // allow a later retry
         throw new BackendUnavailableError("failed to initialise against Redis", { cause: err });
@@ -113,8 +135,33 @@ export class RwLock {
     return Date.now() + this.serverTimeOffsetMs;
   }
 
-  /** Release the blocking pool. Does NOT touch the user's client. */
+  /** Whether the keyspace-expiry subscriber is currently running. */
+  get keyspaceActive(): boolean {
+    return this.keyspace?.active ?? false;
+  }
+
+  /** Read the server's notify-keyspace-events flags; true iff expired keyevents fire. */
+  private async detectKeyspaceEvents(): Promise<boolean> {
+    try {
+      const reply = (await this.client.sendCommand(["CONFIG", "GET", "notify-keyspace-events"])) as unknown;
+      let flags = "";
+      if (Array.isArray(reply)) flags = String(reply[1] ?? "");
+      else if (reply && typeof reply === "object") {
+        flags = String((reply as Record<string, unknown>)["notify-keyspace-events"] ?? "");
+      }
+      // need keyevent notifications (E) and expired events (x, or A which includes x)
+      return /E/.test(flags) && (/x/.test(flags) || /A/.test(flags));
+    } catch {
+      return false; // CONFIG denied (e.g. managed Redis) -> use the self-wake path
+    }
+  }
+
+  /** Release the blocking pool and keyspace subscriber. Does NOT touch the user's client. */
   async close(): Promise<void> {
+    const sub = this.keyspace;
+    this.keyspace = undefined;
+    if (sub) await sub.stop().catch(() => {});
+
     const pool = this.blockingPool;
     this.blockingPool = undefined;
     this.ready = undefined;

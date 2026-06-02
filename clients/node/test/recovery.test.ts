@@ -1,0 +1,115 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { RwLock, type RwLockConfig } from "../src/index.js";
+import { startRedis, type RedisHarness } from "./redis-harness.js";
+
+// M4: recovery. Lazy cleanup and per-waiter self-wake are exercised in write-lock.test.ts;
+// here we focus on the optional, auto-detected keyspace-expiry subscriber (SPEC §10.3).
+
+const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function holderCount(h: RedisHarness, r: string): Promise<number> {
+  const c = await h.newClient();
+  return Number(await c.zCard(`rwlock:{${r}}:holders`));
+}
+
+describe("M4 keyspace subscriber (events ENABLED)", () => {
+  let harness: RedisHarness;
+  const locks: RwLock[] = [];
+  beforeAll(async () => {
+    harness = await startRedis({ notifyKeyspaceEvents: "Ex" });
+  });
+  afterAll(async () => {
+    await harness.stop();
+  });
+  beforeEach(async () => {
+    await harness.flush();
+  });
+  afterEach(async () => {
+    await Promise.all(locks.splice(0).map((l) => l.close().catch(() => {})));
+  });
+
+  async function mk(config?: RwLockConfig): Promise<RwLock> {
+    const rw = new RwLock(await harness.newClient(), config);
+    locks.push(rw);
+    return rw;
+  }
+
+  it("detects the capability and activates the subscriber", async () => {
+    const rw = await mk();
+    await rw.acquireWrite("k", { ownerId: "w1", leaseMs: 30_000 }).then((h) => rw.release(h));
+    expect(rw.keyspaceActive).toBe(true);
+  });
+
+  it("proactively reclaims a crashed holder with NO waiter (subscriber-driven)", async () => {
+    const recovered: string[] = [];
+    const rw = await mk({ onRecovery: (r) => recovered.push(r) });
+
+    // crash: take a short lease and never release; nobody is waiting.
+    await rw.acquireWrite("orphan", { ownerId: "w1", leaseMs: 300 });
+    expect(await holderCount(harness, "orphan")).toBe(1);
+
+    // the lease-expiry sentinel fires ~300ms later -> subscriber runs expire_and_grant,
+    // sweeping the dead holder even though no other operation touched the resource.
+    await settle(900);
+    expect(await holderCount(harness, "orphan")).toBe(0);
+    expect(recovered).toContain("orphan");
+  });
+
+  it("still recovers a waiting acquirer after a holder crash", async () => {
+    const a = await mk();
+    const b = await mk();
+    await a.acquireWrite("h", { ownerId: "w1", leaseMs: 400 }); // crash (never released)
+    const start = Date.now();
+    const h2 = await b.acquireWrite("h", { ownerId: "w2", leaseMs: 5000, waitMs: 8000 });
+    expect(h2.token).toContain("w2");
+    expect(Date.now() - start).toBeLessThan(2500);
+    await b.release(h2);
+  });
+});
+
+describe("M4 keyspace subscriber (events DISABLED)", () => {
+  let harness: RedisHarness;
+  const locks: RwLock[] = [];
+  beforeAll(async () => {
+    harness = await startRedis(); // no notify-keyspace-events
+  });
+  afterAll(async () => {
+    await harness.stop();
+  });
+  beforeEach(async () => {
+    await harness.flush();
+  });
+  afterEach(async () => {
+    await Promise.all(locks.splice(0).map((l) => l.close().catch(() => {})));
+  });
+
+  async function mk(config?: RwLockConfig): Promise<RwLock> {
+    const rw = new RwLock(await harness.newClient(), config);
+    locks.push(rw);
+    return rw;
+  }
+
+  it("does not activate the subscriber (silent fallback)", async () => {
+    const rw = await mk();
+    await rw.acquireWrite("k", { ownerId: "w1" }).then((h) => rw.release(h));
+    expect(rw.keyspaceActive).toBe(false);
+  });
+
+  it("does NOT proactively reclaim (a crashed holder lingers until the next op)", async () => {
+    const rw = await mk();
+    await rw.acquireWrite("orphan", { ownerId: "w1", leaseMs: 300 }); // crash, no waiter
+    await settle(900);
+    // without events, nothing swept it; the stale ZSET member remains until a later op
+    expect(await holderCount(harness, "orphan")).toBe(1);
+    // ...and the next acquirer reclaims it via lazy cleanup
+    const h = await rw.acquireWrite("orphan", { ownerId: "w2", waitMs: 1000 });
+    expect(h.token).toContain("w2");
+    await rw.release(h);
+  });
+
+  it("respects keyspaceEvents:'off' even when the server supports them", async () => {
+    const rw = await mk({ keyspaceEvents: "off" });
+    await rw.acquireWrite("k", { ownerId: "w1" }).then((h) => rw.release(h));
+    expect(rw.keyspaceActive).toBe(false);
+  });
+});

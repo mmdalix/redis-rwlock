@@ -27,6 +27,7 @@ if is_blank(granted) then
   if redis.call('HGET', rk, 'mode') == 'write' then dec_queued_writers(k) end
   redis.call('DEL', rk)
   if was_head then grant_from_queue(k, prefix, now, notify_ttl) end
+  arm_lease_sentinel(k, now)
   return { 'CANCELLED' }
 end
 
@@ -36,4 +37,5 @@ redis.call('HDEL', k.holder_meta, granted)
 redis.call('DEL', rk)
 recompute_state_cache(k)
 grant_from_queue(k, prefix, now, notify_ttl)
+arm_lease_sentinel(k, now)
 return { 'RECLAIMED', granted }

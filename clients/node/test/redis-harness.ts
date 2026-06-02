@@ -40,15 +40,18 @@ async function waitForReady(url: string, timeoutMs = 10000): Promise<void> {
   }
 }
 
-export async function startRedis(): Promise<RedisHarness> {
+export interface StartRedisOptions {
+  /** e.g. "Ex" to enable expired keyevent notifications for the M4 subscriber tests. */
+  notifyKeyspaceEvents?: string;
+}
+
+export async function startRedis(opts: StartRedisOptions = {}): Promise<RedisHarness> {
   const port = randomPort();
   const url = `redis://127.0.0.1:${port}`;
   const dir = mkdtempSync(join(tmpdir(), "rwlock-redis-"));
-  const proc: ChildProcess = spawn(
-    "redis-server",
-    ["--port", String(port), "--save", "", "--appendonly", "no", "--dir", dir],
-    { stdio: "ignore" },
-  );
+  const args = ["--port", String(port), "--save", "", "--appendonly", "no", "--dir", dir];
+  if (opts.notifyKeyspaceEvents) args.push("--notify-keyspace-events", opts.notifyKeyspaceEvents);
+  const proc: ChildProcess = spawn("redis-server", args, { stdio: "ignore" });
   proc.on("error", (e) => {
     throw new Error(`failed to spawn redis-server: ${e.message}`);
   });

@@ -59,6 +59,7 @@ if grantable then
   else
     redis.call('HSET', k.state, 'mode', 'read', 'writer_token', '', 'reader_count', reader_count + 1)
   end
+  arm_lease_sentinel(k, now)
   return { 'GRANTED', token, fencing, expire_at, mode }
 end
 
@@ -87,4 +88,6 @@ local hh = redis.call('ZRANGE', k.holders, 0, 0, 'WITHSCORES')
 local head_holder_lease = -1
 if #hh >= 2 then head_holder_lease = tonumber(hh[2]) end
 
+-- arm the sentinel to the current holder's lease so a subscriber can wake us on crash
+arm_lease_sentinel(k, now)
 return { 'QUEUED', request_id, notify_key(prefix, request_id), wait_deadline, head_holder_lease }

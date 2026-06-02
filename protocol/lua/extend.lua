@@ -22,4 +22,5 @@ end
 
 local new_expire = now + lease_ms
 redis.call('ZADD', k.holders, new_expire, token)
+arm_lease_sentinel(k, now)
 return { 'OK', new_expire }

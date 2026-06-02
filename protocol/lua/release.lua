@@ -22,4 +22,5 @@ redis.call('ZREM', k.holders, token)
 redis.call('HDEL', k.holder_meta, token)
 recompute_state_cache(k)
 grant_from_queue(k, prefix, now, notify_ttl)
+arm_lease_sentinel(k, now)
 return { 'OK' }
