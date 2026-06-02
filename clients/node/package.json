@@ -1,9 +1,30 @@
 {
-  "name": "@org/redis-rwlock",
-  "version": "0.0.0",
-  "private": true,
-  "description": "Distributed read/write lock over Redis — Node.js reference client (thin wrapper over shared Lua)",
+  "name": "redis-rwlock",
+  "version": "0.1.0",
+  "description": "Distributed read/write lock over Redis — many readers or one writer, with fencing tokens, leases, FIFO fair queueing (no polling), a scoped API, and crash recovery.",
   "license": "MIT",
+  "author": "mmdalix",
+  "homepage": "https://github.com/mmdalix/redis-rwlock#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mmdalix/redis-rwlock.git",
+    "directory": "clients/node"
+  },
+  "bugs": {
+    "url": "https://github.com/mmdalix/redis-rwlock/issues"
+  },
+  "keywords": [
+    "redis",
+    "lock",
+    "rwlock",
+    "read-write-lock",
+    "distributed-lock",
+    "mutex",
+    "fencing-token",
+    "lease",
+    "node-redis",
+    "cluster"
+  ],
   "type": "module",
   "sideEffects": false,
   "main": "./dist/index.cjs",
@@ -34,7 +55,12 @@
     "build": "tsdown",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run typecheck"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "redis": "^5 || ^6"
