@@ -40,7 +40,7 @@ Deferred to M7 (when a 2nd language lands): `clients/` vs top-level layout decis
 | M2 | FIFO **queue** + all three `fairness` policies + `cancel_wait` ghost-grant reconciliation. read_preferring (readers jump writers), fifo & write_preferring (no writer starvation), and the timeout↔grant race (§20.5, stress-tested) all proven. | ✅ done |
 | M3 | `extend` safety margin + opt-in **watchdog** + **scoped API** (`withWriteLock`/`withReadLock`) with `AbortSignal` on loss + `await using` (AsyncDisposable) + cancelable acquire via `signal`. | ✅ done |
 | M4 | **Recovery**: lazy cleanup + self-wake + optional auto-detected keyspace-expiry subscriber. Adds a per-resource `lease_expiry` sentinel key (TTL = soonest holder lease) so holder-lease expiry is observable via `__keyevent@*__:expired`; subscriber runs expire_and_grant out-of-band. Never CONFIG SET; silent fallback to self-wake. | ✅ done |
-| M5 | **Cluster** hash-tagging + **Functions-or-EVALSHA** delivery + capability probe + **version handshake** (`rwlock:__module__`). | EVALSHA done; rest TODO |
+| M5 | **Functions-or-EVALSHA** delivery (FCALL/`fCall`, routable on Cluster) + capability probe + **version handshake** (`rwlock:__module__`, refuses incompatible major) + **Cluster** hash-tag co-location (verified via CRC16 slot, anchored to Redis). Live multi-node Cluster *client* integration (per-node FUNCTION LOAD, per-node blocking-BLPOP pools, MOVED handling) is a follow-up. | ✅ done (single-node); live-cluster client TODO |
 | M6 | **Observability** (metrics/tracing/`inspect`) + dedicated blocking-connection **pool** + backpressure. | TODO |
 | M7 | **Second language port** over the same Lua + **cross-language conformance** + full repo structure & CI. | TODO |
 

@@ -1,5 +1,7 @@
 export { RwLock, keyPrefix, type LockScope } from "./rwlock.js";
 export { LockHandle, type HandleOwner, type LockHandleData } from "./handle.js";
+export { PROTOCOL_VERSION } from "./lua.generated.js";
+export { type ModuleInfo, MODULE_KEY } from "./install.js";
 export {
   RwLockError,
   WaitTimeoutError,

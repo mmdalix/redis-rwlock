@@ -42,6 +42,12 @@ export interface RwLockConfig {
   keyspaceEvents?: "auto" | "off";
   /** Invoked after a recovery sweep triggered by a keyspace-expiry event. */
   onRecovery?: (resource: string) => void;
+  /** Lua delivery: "functions" (FCALL), "scripts" (EVALSHA), or "auto" (Functions if
+   *  available, else EVALSHA). Default "auto" (SPEC §17). */
+  delivery?: "auto" | "functions" | "scripts";
+  /** Contend even if the server's protocol MAJOR differs from this client (SPEC §16).
+   *  Default false — a mismatch raises IncompatibleServerLogicError. */
+  allowIncompatibleProtocol?: boolean;
 }
 
 export const DEFAULTS = {
@@ -58,4 +64,6 @@ export const DEFAULTS = {
   extensionMarginMs: 500,
   keyspaceEvents: "auto" as "auto" | "off",
   onRecovery: (_resource: string): void => {},
+  delivery: "auto" as "auto" | "functions" | "scripts",
+  allowIncompatibleProtocol: false,
 } as const;

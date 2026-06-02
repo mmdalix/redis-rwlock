@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { createClientPool, type RedisClientPoolType, type RedisClientType } from "redis";
-import { ScriptRunner } from "./scripts.js";
+import { type Delivery } from "./delivery.js";
+import { installAndHandshake, type InstallClient, type ModuleInfo } from "./install.js";
 import { LockHandle, type HandleOwner } from "./handle.js";
 import { KeyspaceSubscriber, type SubscriberConn } from "./keyspace.js";
-import { BackendUnavailableError, LockLostError, WaitTimeoutError } from "./errors.js";
+import { BackendUnavailableError, LockLostError, RwLockError, WaitTimeoutError } from "./errors.js";
 import {
   DEFAULTS,
   type AcquireOptions,
@@ -57,12 +58,14 @@ interface GrantPayload {
  *
  * Provides the raw acquire/release/extend methods, the scoped front-door `withWriteLock`/
  * `withReadLock` (guaranteed release + cancellation + optional watchdog), and
- * AsyncDisposable handles for `await using`. Cluster routing, the Functions
- * delivery path, and observability arrive in later milestones.
+ * AsyncDisposable handles for `await using`. Lua is delivered via Redis Functions
+ * (FCALL) or EVALSHA, chosen by capability probe, with a cross-version handshake.
+ * Observability and full multi-node Cluster client integration arrive later.
  */
 export class RwLock {
   private readonly client: RedisClientLike;
-  private readonly scripts: ScriptRunner;
+  private delivery?: Delivery;
+  private moduleInfo?: ModuleInfo;
   private readonly cfg: Required<RwLockConfig>;
   private ready?: Promise<void>;
   private serverTimeOffsetMs = 0;
@@ -74,7 +77,6 @@ export class RwLock {
 
   constructor(client: RedisClientLike, config: RwLockConfig = {}) {
     this.client = client;
-    this.scripts = new ScriptRunner(client);
     this.cfg = { ...DEFAULTS, ...config };
     this.owner = {
       releaseToken: (resource, token) => this.releaseToken(resource, token),
@@ -93,6 +95,14 @@ export class RwLock {
         const serverMs = Number(t[0]) * 1000 + Math.floor(Number(t[1]) / 1000);
         this.serverTimeOffsetMs = serverMs - Date.now();
 
+        // Capability probe + cross-version handshake + Lua install (SPEC §16, §17).
+        const installed = await installAndHandshake(this.client as unknown as InstallClient, {
+          delivery: this.cfg.delivery,
+          allowIncompatibleProtocol: this.cfg.allowIncompatibleProtocol,
+        });
+        this.delivery = installed.delivery;
+        this.moduleInfo = installed.info;
+
         const pool = createClientPool(this.client.options, {
           maximum: this.cfg.blockingPoolSize,
           acquireTimeout: this.cfg.maxWaitMs,
@@ -109,7 +119,7 @@ export class RwLock {
           const sub = new KeyspaceSubscriber(
             () => this.client.duplicate() as unknown as SubscriberConn,
             async (resource) => {
-              await this.scripts.run("expireAndGrant", [keyPrefix(resource)], [
+              await this.delivery!.run("expireAndGrant", [keyPrefix(resource)], [
                 String(this.cfg.notifyKeyTtlMs),
               ]);
               this.cfg.onRecovery(resource);
@@ -124,6 +134,7 @@ export class RwLock {
         }
       })().catch((err) => {
         this.ready = undefined; // allow a later retry
+        if (err instanceof RwLockError) throw err; // handshake/capability errors pass through
         throw new BackendUnavailableError("failed to initialise against Redis", { cause: err });
       });
     }
@@ -138,6 +149,16 @@ export class RwLock {
   /** Whether the keyspace-expiry subscriber is currently running. */
   get keyspaceActive(): boolean {
     return this.keyspace?.active ?? false;
+  }
+
+  /** Active Lua delivery mode once initialised ("functions" | "scripts"). */
+  get deliveryMode(): "functions" | "scripts" | undefined {
+    return this.delivery?.mode;
+  }
+
+  /** The installed module marker (protocol version, impl version, sha) once initialised. */
+  get module(): ModuleInfo | undefined {
+    return this.moduleInfo;
   }
 
   /** Read the server's notify-keyspace-events flags; true iff expired keyevents fire. */
@@ -223,7 +244,7 @@ export class RwLock {
 
     let res: unknown[];
     try {
-      res = (await this.scripts.run(
+      res = (await this.delivery!.run(
         "acquire",
         [prefix],
         [
@@ -302,7 +323,7 @@ export class RwLock {
       // Woke with no grant -> the holder may have crashed. Run maintenance once
       // (which may push a grant into our mailbox), refresh the boundary, re-block.
       try {
-        await this.scripts.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
+        await this.delivery!.run("expireAndGrant", [prefix], [String(this.cfg.notifyKeyTtlMs)]);
       } catch (err) {
         throw new BackendUnavailableError(`wait maintenance failed for ${resource}`, { cause: err });
       }
@@ -334,7 +355,7 @@ export class RwLock {
   /** Remove our queued request and reconcile a last-instant grant (CANCELLED/RECLAIMED/GONE). */
   private async abortPending(prefix: string, requestId: string): Promise<void> {
     try {
-      await this.scripts.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
+      await this.delivery!.run("cancelWait", [prefix], [requestId, String(this.cfg.notifyKeyTtlMs)]);
     } catch (err) {
       throw new BackendUnavailableError(`cancel_wait failed`, { cause: err });
     }
@@ -387,7 +408,7 @@ export class RwLock {
   private async releaseToken(resource: string, token: string): Promise<void> {
     await this.ensureReady();
     try {
-      await this.scripts.run(
+      await this.delivery!.run(
         "release",
         [keyPrefix(resource)],
         [token, String(this.cfg.notifyKeyTtlMs)],
@@ -402,7 +423,7 @@ export class RwLock {
     const lease = this.clampLease(leaseMs);
     let res: unknown[];
     try {
-      res = (await this.scripts.run("extend", [keyPrefix(resource)], [token, String(lease)])) as unknown[];
+      res = (await this.delivery!.run("extend", [keyPrefix(resource)], [token, String(lease)])) as unknown[];
     } catch (err) {
       throw new BackendUnavailableError(`extend failed for ${resource}`, { cause: err });
     }
