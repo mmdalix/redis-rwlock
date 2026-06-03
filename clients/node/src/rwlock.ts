@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { hostname } from "node:os";
 import { createClientPool, type RedisClientPoolType, type RedisClientType } from "redis";
 import { type Delivery } from "./delivery.js";
 import { installAndHandshake, type InstallClient, type ModuleInfo } from "./install.js";
@@ -36,6 +37,11 @@ function newRequestId(): string {
   // Roughly time-sortable; a ULID/UUIDv7 would be ideal but is not required.
   return `${Date.now().toString(36)}-${randomUUID()}`;
 }
+
+// Default "who holds it" identity when the caller omits ownerId — like redlock's
+// auto-generated owner, but human-meaningful (which process holds it) for inspect/logs.
+// Sanitized so it can never contain the token separators ':' / '{' / '}'.
+const DEFAULT_OWNER_ID = `${hostname().replace(/[:{}]/g, "_")}#${process.pid}`;
 
 function abortError(signal: AbortSignal): Error {
   const reason = signal.reason as unknown;
@@ -546,9 +552,14 @@ export class RwLock {
   }
 
   private resolveOptions(opts: AcquireOptions): ResolvedOptions {
-    const ownerId = opts.ownerId ?? "";
-    if (this.cfg.requireOwnerId && ownerId === "") {
-      throw new TypeError("ownerId is required (set requireOwnerId: false to opt out)");
+    let ownerId = opts.ownerId ?? "";
+    if (ownerId === "") {
+      // Optional by default: fall back to a process identity (hostname#pid). Teams that
+      // want to force an explicit owner can set requireOwnerId: true.
+      if (this.cfg.requireOwnerId) {
+        throw new TypeError("ownerId is required because requireOwnerId is enabled");
+      }
+      ownerId = DEFAULT_OWNER_ID;
     }
     return {
       leaseMs: this.clampLease(opts.leaseMs ?? this.cfg.defaultLeaseMs),

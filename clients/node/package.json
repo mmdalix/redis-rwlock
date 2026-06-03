@@ -1,6 +1,6 @@
 {
   "name": "redis-rwlock",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Distributed read/write lock over Redis — many readers or one writer, with fencing tokens, leases, FIFO fair queueing (no polling), a scoped API, and crash recovery.",
   "license": "MIT",
   "author": "mmdalix",

@@ -71,7 +71,7 @@ internal blocking-connection pool (it never touches your client).
 |---|---|---|
 | `leaseMs` | 30000 (max 300000) | how long you may hold it |
 | `waitMs` | 10000 (max 60000) | how long to block waiting |
-| `ownerId` | — (required) | who holds it (process/worker id) |
+| `ownerId` | `<hostname>#<pid>` | who holds it (for `inspect`/logs); optional — set `requireOwnerId: true` to force an explicit one |
 | `fairness` | `write_preferring` | `write_preferring` \| `fifo` \| `read_preferring` |
 | `watchdog` | `false` | auto-extend at ~lease/3 while held |
 | `signal` | — | `AbortSignal` to cancel a pending acquire |

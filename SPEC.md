@@ -206,7 +206,7 @@ The waiter blocks here: `BLPOP rwlock:{r}:notify:{id} <seconds>`. On grant the s
 - **Time source is Redis, always.** Scripts obtain `now_ms` from the Redis `TIME` command inside the script; clients pass *durations* (`lease_ms`, `wait_ms`), never absolute timestamps. This removes cross-client clock-skew from all expiry decisions. (`TIME` is permitted in scripts on modern Redis under effects replication.)
 - **`request_id`**: unique per acquire attempt. Recommended: a sortable unique id (UUIDv7 / ULID). MUST NOT contain `:`, `{`, or `}` (it is embedded in the token and used as a key suffix). Any format satisfying uniqueness + this charset interoperates.
 - **`token`**: unique per *granted* hold. The canonical grammar is **`"<owner_id>:<request_id>:<fencing>"`** — minted by the shared scripts (a port must never mint tokens itself). `owner_id` MUST NOT contain `:`. The token is required to release or extend; release/extend MUST verify the token, so a caller can never release another holder's lock. Treat the token as opaque; the grammar is fixed only so all ports mint identical, collision-free tokens (`request_id` guarantees per-attempt uniqueness, `fencing` per-grant).
-- **`owner_id`**: a caller-chosen identity for "who" holds it (process id, worker id, logical actor); MUST NOT contain `:`. `require_owner_id` defaults to true.
+- **`owner_id`**: a caller-chosen identity for "who" holds it (process id, worker id, logical actor); MUST NOT contain `:`. It is for observability/reentrancy, **not** for mutual-exclusion safety (the token's `request_id` + `fencing` already make it unique). Optional: clients SHOULD auto-default it to a process identity (e.g. `<hostname>#<pid>`) when omitted; `require_owner_id` (force an explicit one) defaults to **false**.
 - **`fencing`**: monotonic integer from `INCR rwlock:{r}:fence`, returned on every grant (Section 12).
 
 ---
@@ -524,7 +524,7 @@ AcquireOptions {
   mode: LockMode
   leaseMs: number            # default 30000, max 300000
   waitMs: number             # default 10000,  max 60000
-  ownerId?: string           # required by default
+  ownerId?: string           # optional; auto-defaults to "<hostname>#<pid>"
   fairness?: "write_preferring" | "fifo" | "read_preferring"   # default write_preferring
   watchdog?: boolean         # default false
   maxReaderBatch?: number    # default 1000
@@ -692,7 +692,7 @@ max_reader_batch        = 1000
 notify_key_ttl_ms       = 60000
 request_key_ttl_grace_ms= 60000                   # request TTL = wait_ms + this
 enable_fencing          = true
-require_owner_id        = true
+require_owner_id        = false                   # else ownerId auto-defaults to <hostname>#<pid>
 blocking_pool_size      = configurable (e.g. 16, with backpressure on exhaustion)
 time_source             = redis_server (TIME)     # never client clock
 transport               = "blpop"                 # alt: "sharded_pubsub" (Redis 7+)

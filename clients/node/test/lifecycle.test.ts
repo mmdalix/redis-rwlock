@@ -27,6 +27,18 @@ async function mk(config?: RwLockConfig): Promise<RwLock> {
 }
 
 describe("RwLock lifecycle", () => {
+  it("acquires without an explicit ownerId (auto-defaults to <hostname>#<pid>)", async () => {
+    const rw = await mk(); // default config -> requireOwnerId false
+    const h = await rw.acquireWrite("auto-owner");
+    expect(h.token).toContain("#"); // default owner separator
+    await rw.release(h);
+  });
+
+  it("requireOwnerId:true still requires an explicit ownerId", async () => {
+    const rw = await mk({ requireOwnerId: true });
+    await expect(rw.acquireWrite("needs-owner")).rejects.toBeInstanceOf(TypeError);
+  });
+
   it("rejects acquire after close() with a typed RwLockError (not a TypeError)", async () => {
     const rw = await mk();
     await rw.acquireWrite("lc", { ownerId: "w1" }).then((h) => rw.release(h));

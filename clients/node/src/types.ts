@@ -9,7 +9,9 @@ export interface AcquireOptions {
   leaseMs?: number;
   /** How long to block waiting. Default 10000, clamped to maxWaitMs. */
   waitMs?: number;
-  /** Caller-chosen identity for "who" holds it. Required by default. */
+  /** Caller-chosen identity for "who" holds it (process/worker/actor), surfaced in
+   *  inspect()/metrics/logs. Optional — defaults to `<hostname>#<pid>`. Set
+   *  requireOwnerId: true on the RwLock to force an explicit one. */
   ownerId?: string;
   /** Fairness policy. Default write_preferring (matches Go sync.RWMutex). */
   fairness?: Fairness;
@@ -73,6 +75,8 @@ export interface RwLockConfig {
   maxReaderBatch?: number;
   notifyKeyTtlMs?: number;
   requestKeyTtlGraceMs?: number;
+  /** Require an explicit ownerId on every acquire. Default false — when omitted,
+   *  ownerId auto-defaults to `<hostname>#<pid>`. */
   requireOwnerId?: boolean;
   /** Max dedicated connections for blocking BLPOP waits (SPEC §15). Default 16. */
   blockingPoolSize?: number;
@@ -105,7 +109,7 @@ export const DEFAULTS = {
   maxReaderBatch: 1000,
   notifyKeyTtlMs: 60_000,
   requestKeyTtlGraceMs: 60_000,
-  requireOwnerId: true,
+  requireOwnerId: false,
   blockingPoolSize: 16,
   extensionMarginMs: 500,
   keyspaceEvents: "auto" as "auto" | "off",
