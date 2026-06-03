@@ -1,0 +1,50 @@
+name: Release
+
+# Publish to npm when a version tag is pushed (e.g. `git tag v0.2.1 && git push --tags`).
+# Make sure clients/node/package.json "version" matches the tag before tagging.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write # required for npm provenance / OIDC Trusted Publishing
+
+defaults:
+  run:
+    working-directory: clients/node
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Install Redis (for the test gate)
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - run: npm install
+
+      - name: Verify tag matches package.json version
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          TAG="${GITHUB_REF_NAME#v}"
+          test "$PKG" = "$TAG" || { echo "tag v$TAG != package.json $PKG"; exit 1; }
+
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # Trusted Publishing (OIDC): configure the package's trusted publisher on
+      # npmjs.com (repo + this workflow) and NO token is needed. --provenance adds a
+      # verified provenance attestation. If you prefer a token instead, set the
+      # NPM_TOKEN repo secret and uncomment the env line below.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        # env:
+        #   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

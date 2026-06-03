@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: clients/node
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # The test harness spawns its own throwaway redis-server per file,
+      # so we just need the binary on PATH (Redis 7+, for the FUNCTION path).
+      - name: Install Redis
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - run: npm install
+
+      - name: Embedded Lua is in sync with protocol/lua
+        run: |
+          npm run gen:lua
+          git diff --exit-code src/lua.generated.ts
+
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      - name: Validate package (publint + are-the-types-wrong)
+        run: |
+          npx --yes publint
+          npx --yes @arethetypeswrong/cli --pack .
