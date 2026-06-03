@@ -156,13 +156,28 @@ func (l *RwLock) acquire(ctx context.Context, mode Mode, resource string, opts [
 	}
 
 	if toStr(arr[0]) == "GRANTED" {
-		return l.newHandle(resource, Mode(toStr(arr[4])), toStr(arr[1]), toInt64(arr[2]), toInt64(arr[3])), nil
+		h := l.newHandle(resource, Mode(toStr(arr[4])), toStr(arr[1]), toInt64(arr[2]), toInt64(arr[3]))
+		l.armHandle(h, o)
+		return h, nil
 	}
 	// QUEUED: [ , request_id, notify_key, wait_deadline_ms, next_wake_ms]
 	notifyKey := toStr(arr[2])
 	waitDeadline := toInt64(arr[3])
 	nextWake := toInt64(arr[4])
-	return l.waitForGrant(ctx, resource, prefix, reqID, notifyKey, waitDeadline, nextWake)
+	h, err := l.waitForGrant(ctx, resource, prefix, reqID, notifyKey, waitDeadline, nextWake)
+	if err != nil {
+		return nil, err
+	}
+	l.armHandle(h, o)
+	return h, nil
+}
+
+// armHandle records the configured lease and starts the watchdog if requested.
+func (l *RwLock) armHandle(h *Handle, o acquireOptions) {
+	h.lease = o.lease
+	if o.watchdog {
+		h.startWatchdog()
+	}
 }
 
 func (l *RwLock) waitForGrant(ctx context.Context, resource, prefix, reqID, notifyKey string, waitDeadline, nextWake int64) (*Handle, error) {
@@ -246,10 +261,6 @@ func (l *RwLock) handleFromPayload(resource, payload string) (*Handle, error) {
 		return nil, fmt.Errorf("%w: bad grant payload for %s: %v", ErrBackendUnavailable, resource, err)
 	}
 	return l.newHandle(resource, Mode(g.Mode), g.Token, g.Fencing, g.LeaseUntilMs), nil
-}
-
-func (l *RwLock) newHandle(resource string, mode Mode, token string, fencing, leaseUntilMs int64) *Handle {
-	return &Handle{Resource: resource, Mode: mode, Token: token, Fencing: fencing, LeaseUntil: time.UnixMilli(leaseUntilMs), owner: l}
 }
 
 func (l *RwLock) releaseToken(ctx context.Context, resource, token string) error {

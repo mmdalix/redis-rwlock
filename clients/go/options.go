@@ -101,6 +101,7 @@ type acquireOptions struct {
 	fairness       Fairness
 	ownerID        string
 	maxReaderBatch int
+	watchdog       bool
 	hasLease       bool
 	hasWait        bool
 	hasFairness    bool
@@ -132,3 +133,7 @@ func Owner(id string) AcquireOption { return func(o *acquireOptions) { o.ownerID
 func MaxReaderBatch(n int) AcquireOption {
 	return func(o *acquireOptions) { o.maxReaderBatch = n; o.hasMaxBatch = true }
 }
+
+// Watchdog auto-extends the lease at ~lease/3 while held, and cancels the handle's
+// Context if the lock is ever lost.
+func Watchdog() AcquireOption { return func(o *acquireOptions) { o.watchdog = true } }

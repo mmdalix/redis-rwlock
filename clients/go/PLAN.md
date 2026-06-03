@@ -207,8 +207,8 @@ clients/go/
 | ID | Scope |
 |----|-------|
 | **G0** | Module + embedded Lua + delivery/handshake; raw `AcquireWrite`/`AcquireRead`/`Release`/`Extend`; blocking-pool BLPOP wait loop with `next_wake`; fencing; fail-closed; `errors.Is` taxonomy. **✅ done** |
-| **G1** | Read locks + `grant_contiguous_readers`/`grant_readers_anywhere` + all three fairness policies (all in shared Lua — just exercise + test). |
-| **G2** | `Extend` (safety margin) + watchdog goroutine + scoped `WithWriteLock`/`WithReadLock` (ctx cancel on loss) + generic `DoWrite`/`DoRead`. |
+| **G1** | Read locks + fairness policies (write_preferring blocks/serves; read_preferring jumps) — exercised against the shared Lua. **✅ done** |
+| **G2** | `Extend` safety margin + watchdog goroutine + scoped `WithWriteLock`/`WithReadLock` (Context cancelled on loss, cause `ErrLockLost`) + generic `DoWrite`/`DoRead`. **✅ done** |
 | **G3** | Recovery (self-wake + optional keyspace subscriber) + `Inspect` + metrics/tracing interfaces + slog logger. |
 | **G4** | Conformance suite green + **mixed-language interop (Go↔Node)** + `sync-lua`/`check-sync` + `go.yml` CI + first `clients/go/v0.1.0` tag. |
 

@@ -34,8 +34,8 @@ func TestAcquireWriteGrantsWithFencing(t *testing.T) {
 	if h.Fencing <= 0 {
 		t.Fatalf("fencing = %d, want > 0", h.Fencing)
 	}
-	if !h.LeaseUntil.After(before) {
-		t.Fatalf("leaseUntil %v not after %v", h.LeaseUntil, before)
+	if !h.LeaseUntil().After(before) {
+		t.Fatalf("leaseUntil %v not after %v", h.LeaseUntil(), before)
 	}
 	if err := h.Release(ctx); err != nil {
 		t.Fatalf("release: %v", err)
@@ -164,11 +164,11 @@ func TestExtendRenewsAndReportsLost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	before := h.LeaseUntil
+	before := h.LeaseUntil()
 	if err := h.Extend(ctx, 60*time.Second); err != nil {
 		t.Fatalf("extend: %v", err)
 	}
-	if !h.LeaseUntil.After(before) {
+	if !h.LeaseUntil().After(before) {
 		t.Fatalf("extend did not push leaseUntil")
 	}
 	_ = h.Release(ctx)
