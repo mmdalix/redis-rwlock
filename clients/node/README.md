@@ -10,12 +10,27 @@ All lock logic lives in atomic, server-side Redis scripts (delivered as a Redis
 **FUNCTION** library, falling back to `EVALSHA`); the client is a thin wrapper over
 your existing [`node-redis`](https://github.com/redis/node-redis) client.
 
-> ⚠️ **Correctness note.** This is a **lease-based** lock. For *efficiency* (avoid
-> duplicate work, reduce contention) it's safe as-is. For *correctness* (a
-> double-grant would corrupt data or money) you MUST enforce the returned
-> **fencing token** at your storage/service layer — the lock alone is not a
-> sufficient correctness boundary. If you need a linearizable lock without fencing,
-> use a consensus system (etcd/ZooKeeper/Consul).
+> ### Is this safe? (read once — 30 seconds)
+>
+> Like **every** distributed lock built on Redis — **including Redlock** — this is a
+> *lease* (a lock with a TTL), not a linearizable lock. A holder that pauses (GC, OS
+> scheduling, VM migration) longer than its lease can have the lock reassigned while it
+> still thinks it holds it. **No Redis-side trick removes this** — it's inherent to
+> distributed locking ([the well-known result](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html)),
+> not a quirk of this library.
+>
+> The fix is a **fencing token**, and this is where `redis-rwlock` goes *further* than
+> most: **every acquire returns a monotonic `fencingToken`** — the exact tool that
+> closes the gap. Plain Redlock doesn't give you one.
+>
+> - **Using it for efficiency** (avoid duplicate work, reduce contention, single-flight a
+>   job/cache rebuild)? You're done — safe as-is, like any lock.
+> - **Using it for correctness** (a double-grant would corrupt data or move money)? Enforce
+>   the token at your storage layer in one line: reject any write whose `fencingToken` is
+>   `≤` the highest you've already accepted for that resource.
+>
+> If you can't do a resource-side check and need linearizability, use a consensus system
+> (etcd / ZooKeeper / Consul). For everything else, a fenced Redis lock is the pragmatic choice.
 
 ## Install
 

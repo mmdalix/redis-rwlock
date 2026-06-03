@@ -9,11 +9,16 @@ All lock logic lives in atomic, server-side Redis scripts; clients are thin
 wrappers. This guarantees identical semantics across language ports. The full
 design is in [`SPEC.md`](./SPEC.md); the build sequence is in [`PLAN.md`](./PLAN.md).
 
-> ⚠️ **Correctness note (read this).** This library provides **lease-based** locks.
-> For *efficiency* (don't do duplicate work, reduce contention) it is safe as-is.
-> For *correctness* (a double-grant would corrupt data or money), you MUST enforce
-> the returned **fencing token** at your storage/service layer — the lock alone is
-> not a sufficient correctness boundary. See `SPEC.md` §2 and §12.
+> ### Is this safe?
+>
+> Like **every** Redis-based distributed lock — **including Redlock** — this is a *lease*
+> (a lock with a TTL), not a linearizable lock: a holder that pauses past its lease can be
+> superseded. That's [inherent to distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
+> not a quirk of this library. The fix is a **fencing token** — and unlike plain Redlock,
+> **every acquire here returns one** (`fencingToken`). For *efficiency* (dedupe work,
+> reduce contention) it's safe as-is; for *correctness* (a double-grant corrupts data/money)
+> enforce that token at your storage layer (reject any write with a `≤` token). See
+> `SPEC.md` §2 and §12.
 
 ## Status
 
