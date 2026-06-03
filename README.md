@@ -67,7 +67,7 @@ Full Node docs and API: **[`clients/node`](./clients/node) / [npm](https://www.n
 | Language | Package | Status |
 |---|---|---|
 | Node.js / TypeScript | [`redis-rwlock`](https://www.npmjs.com/package/redis-rwlock) (`clients/node`) | ✅ published |
-| Go | [`clients/go`](./clients/go) | 🚧 in repo, unreleased — passes the shared conformance suite + Go↔Node interop |
+| Go | [`github.com/mmdalix/redis-rwlock/clients/go`](https://pkg.go.dev/github.com/mmdalix/redis-rwlock/clients/go) (`clients/go`) | ✅ released — passes the shared conformance suite + Go↔Node interop |
 | Python | — | 🛣️ planned |
 
 The Lua protocol and conformance scenarios in [`protocol/`](./protocol) are the shared
