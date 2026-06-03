@@ -1,94 +1,119 @@
 # redis-rwlock
 
-A distributed **read/write lock** over Redis. Many readers may hold a resource
-together, or exactly one writer holds it exclusively — with FIFO, queue-based
-waiting (no polling), immediate hand-off on release, per-acquisition leases,
-fencing tokens, and **zero required background infrastructure**.
+[![npm version](https://img.shields.io/npm/v/redis-rwlock.svg)](https://www.npmjs.com/package/redis-rwlock)
+[![CI](https://github.com/mmdalix/redis-rwlock/actions/workflows/ci.yml/badge.svg)](https://github.com/mmdalix/redis-rwlock/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
-All lock logic lives in atomic, server-side Redis scripts; clients are thin
-wrappers. This guarantees identical semantics across language ports. The full
-design is in [`SPEC.md`](./SPEC.md); the build sequence is in [`PLAN.md`](./PLAN.md).
+> A distributed **read/write lock** over Redis — many readers or one writer — with
+> FIFO fair queueing (no polling), instant hand-off, leases, a watchdog, crash
+> recovery with **zero background infrastructure**, and a **fencing token on every
+> acquire**. Honest about correctness, ergonomic to use.
 
-> ### Is this safe?
->
-> Like **every** Redis-based distributed lock — **including Redlock** — this is a *lease*
-> (a lock with a TTL), not a linearizable lock: a holder that pauses past its lease can be
-> superseded. That's [inherent to distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
-> not a quirk of this library. The fix is a **fencing token** — and unlike plain Redlock,
-> **every acquire here returns one** (`fencingToken`). For *efficiency* (dedupe work,
-> reduce contention) it's safe as-is; for *correctness* (a double-grant corrupts data/money)
-> enforce that token at your storage layer (reject any write with a `≤` token). See
-> `SPEC.md` §2 and §12.
+The organizing idea: **one brain, many clients.** All lock logic lives in atomic,
+server-side Redis scripts (a Redis FUNCTION library, with an `EVALSHA` fallback);
+each language client is a thin wrapper over the user's existing Redis client. That's
+what lets a Go writer and a Python reader contend on the same resource and behave
+*identically* — the semantics live in one place, not reimplemented per language.
 
-## Status
+## Is it safe?
 
-Early development (`PROTOCOL_VERSION 1`, unreleased). The shared Lua protocol (`protocol/lua/`) and the
-**Node.js** reference client (`clients/node/`) implement read/write locks, FIFO queueing
-with all three fairness policies, immediate hand-off, fencing tokens, the scoped API
-(`withWriteLock`/`withReadLock`, watchdog, `AbortSignal`, `await using`), crash recovery
-(lazy cleanup + self-wake + optional keyspace-event subscriber), Functions-or-EVALSHA
-delivery with a cross-version handshake, and observability (`inspect`, metrics, tracing).
-See `PLAN.md` for the milestone roadmap and `COMPATIBILITY.md` for protocol versions.
+Like **every** Redis-based distributed lock — **including Redlock** — this is a *lease*
+(a lock with a TTL), not a linearizable lock: a holder that pauses past its lease can be
+superseded. That's [inherent to distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
+not a quirk of this project. The fix is a **fencing token** — and unlike plain Redlock,
+**every acquire here returns one** (`fencingToken`). Use it as-is for *efficiency*
+(dedupe work, reduce contention); for *correctness* (a double-grant corrupts data or
+money) enforce that token at your storage layer (reject any write with a `≤` token).
+Full treatment in [`SPEC.md`](./SPEC.md) §2 and §12.
 
-## Repository layout
+## Highlights
 
-- `protocol/` — language-agnostic source of truth: the Lua scripts and the
-  cross-language conformance scenarios.
-- `clients/node/` — the Node.js/TypeScript client (wraps `node-redis`).
+- 🔁 **Read/write semantics** — shared readers or one exclusive writer.
+- 🎟️ **Fencing tokens** on every grant — the real correctness boundary.
+- 🚦 **Fair, poll-free queueing** — waiters are *handed* the lock via a private mailbox;
+  `write_preferring` / `fifo` / `read_preferring` policies; no retry storms, no
+  cluster-wide pub/sub fan-out.
+- ⏱️ **Leases + opt-in watchdog**, 🧯 **crash recovery with no dispatcher and no
+  `CONFIG SET`**, 🧩 **scoped API** (guaranteed release, `AbortSignal`, `await using`).
+- 🧠 **Atomic Lua state machine** delivered as a Redis FUNCTION library (or `EVALSHA`),
+  with a cross-version handshake, capability detection, and standalone/Sentinel/Cluster
+  support.
+- 📈 **Observability** — `inspect()`, pluggable metrics/tracing.
 
-## Node usage
+## Quickstart (Node.js)
 
-The **scoped API** is the documented front door — it guarantees release, exposes an
-`AbortSignal` that fires the instant the lock is lost, and (with `watchdog`)
-auto-extends long operations:
+```bash
+npm install redis-rwlock redis
+```
 
 ```ts
 import { createClient } from "redis";
-import { RwLock } from "@org/redis-rwlock";
+import { RwLock } from "redis-rwlock";
 
-const client = await createClient().connect();
-const rw = new RwLock(client);
+const rw = new RwLock(await createClient().connect());
 
-await rw.withWriteLock("order:123", { ownerId: "worker-1", leaseMs: 30_000, watchdog: true },
-  async (lock) => {
-    // lock.signal aborts the moment the lease is lost — pass it to your work
-    await doWork({ signal: lock.signal });
-    await storage.write(payload, { fencingToken: lock.fencingToken }); // enforce fencing
-  });
-// released automatically, even on throw
+await rw.withWriteLock("order:123", { leaseMs: 30_000, watchdog: true }, async (lock) => {
+  await doWork({ signal: lock.signal });                         // signal aborts if the lock is lost
+  await storage.write(payload, { fencingToken: lock.fencingToken }); // enforce fencing
+});
 ```
 
-Raw acquire/release for power users, including `await using` for automatic release:
+Full Node docs and API: **[`clients/node`](./clients/node) / [npm](https://www.npmjs.com/package/redis-rwlock)**.
 
-```ts
-await using lock = await rw.acquireWrite("order:123", { ownerId: "worker-1" });
-// ... do work; enforce lock.fencingToken at your storage layer ...
-// released automatically at end of scope
+## Packages
+
+| Language | Package | Status |
+|---|---|---|
+| Node.js / TypeScript | [`redis-rwlock`](https://www.npmjs.com/package/redis-rwlock) (`clients/node`) | ✅ published |
+| Go | — | 🛣️ planned (same shared Lua) |
+| Python | — | 🛣️ planned |
+
+The Lua protocol and conformance scenarios in [`protocol/`](./protocol) are the shared
+source of truth every client port runs against.
+
+## Repository layout
+
+```
+SPEC.md            # the design contract (single source of truth)
+COMPATIBILITY.md   # protocol versions & client ⇄ protocol mapping
+PLAN.md            # milestone roadmap
+protocol/
+  VERSION          # PROTOCOL_VERSION
+  lua/             # the shared, atomic Lua scripts (the "brain")
+  conformance/     # language-agnostic scenarios every client must pass
+clients/
+  node/            # the Node.js / TypeScript client
 ```
 
-## Observability
+## How it works
 
-Pass pluggable `metrics` / `tracer` sinks (adapt to prom-client, OpenTelemetry,
-StatsD, …) and inspect any resource:
+Every transition — *can this caller acquire now; who is next when a holder releases;
+clean up anything expired* — runs inside a **single atomic Redis script**, so there are
+no client-side read-modify-write races. Waiters block on a private `BLPOP` mailbox and
+the releaser pushes the grant straight into it (no polling). State is **derived from
+source-of-truth keys** (a `readers` ZSET + a TTL'd `writer` key), so it can't drift, and
+a crashed writer's key self-expires to free the lock natively. Leases are the
+deadlock backstop; fencing tokens are the correctness backstop. See [`SPEC.md`](./SPEC.md).
 
-```ts
-const rw = new RwLock(client, { metrics, tracer });
-const status = await rw.inspect("order:123");
-// { mode, readerCount, writerActive, queueLength, queuedWriters, oldestWaitMs, nextExpiryMs }
-```
+## Documentation
 
-Metrics emitted include `rwlock_acquire_total{mode,result}`, `rwlock_wait_duration_ms`,
-`rwlock_held_duration_ms`, `rwlock_timeouts_total`, `rwlock_extend_total{result}`,
-`rwlock_release_total`, `rwlock_lock_lost_total`, `rwlock_fencing_token_current`, and
-`rwlock_blocking_connections_in_use` (also on `rw.blockingConnectionsInUse`).
+- **[SPEC.md](./SPEC.md)** — the full protocol & design contract (key schema, scripts,
+  correctness model, Appendix A pseudocode).
+- **[COMPATIBILITY.md](./COMPATIBILITY.md)** — protocol versioning and compatibility.
+- **[PLAN.md](./PLAN.md)** — milestone roadmap.
 
-## Development
+## Contributing
+
+The Lua in `protocol/lua/` is the single source of truth — clients vendor a generated
+copy (`npm run gen:lua`) and must never hand-edit it; CI guards against drift. To work on
+the Node client:
 
 ```bash
 cd clients/node
 npm install
-npm run gen:lua   # embed protocol/lua -> src/lua.generated.ts
-npm test          # spins up a local redis-server per test file
+npm test        # spins up a throwaway redis-server per test file (needs redis-server on PATH)
 ```
 
-Requires a `redis-server` binary on PATH for the test suite.
+## License
+
+[MIT](./LICENSE)
