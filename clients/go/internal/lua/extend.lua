@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/extend.lua — DO NOT EDIT (run tools/sync-lua).
 -- extend.lua — renew the calling holder's lease (never shortens it).
 --
 -- KEYS[1] = prefix

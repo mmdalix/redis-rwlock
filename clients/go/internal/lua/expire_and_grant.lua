@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/expire_and_grant.lua — DO NOT EDIT (run tools/sync-lua).
 -- expire_and_grant.lua — maintenance: evict expired holders/requests, then grant.
 --
 -- KEYS[1] = prefix

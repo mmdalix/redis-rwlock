@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/acquire.lua — DO NOT EDIT (run tools/sync-lua).
 -- acquire.lua — try an immediate grant; otherwise enqueue and return a mailbox.
 --
 -- KEYS[1] = prefix

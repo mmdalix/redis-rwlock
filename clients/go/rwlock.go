@@ -50,6 +50,8 @@ type RwLock struct {
 	closed      bool
 	delivery    delivery
 	offsetMs    int64 // serverNowMs ≈ localNowMs + offsetMs
+	ksPubSub    *redis.PubSub
+	ksCancel    context.CancelFunc
 }
 
 // New wraps an existing go-redis client (standalone, Cluster, or Ring).
@@ -98,6 +100,12 @@ func (l *RwLock) ensureReady(ctx context.Context) error {
 	}
 	l.delivery = d
 	l.blocking = newBlockingClient(l.client, l.cfg.blockingPoolSize)
+
+	// Optional recovery accelerator: subscribe to keyspace expiry if the server has it.
+	if l.cfg.keyspaceEvents && l.detectKeyspaceEvents(ctx) {
+		l.startKeyspace()
+	}
+
 	l.initialized = true
 	return nil
 }
@@ -306,6 +314,7 @@ func (l *RwLock) Close() error {
 	l.mu.Lock()
 	l.closed = true
 	l.initialized = false
+	l.stopKeyspace()
 	b := l.blocking
 	l.blocking = nil
 	l.mu.Unlock()

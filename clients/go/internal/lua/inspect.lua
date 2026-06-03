@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/inspect.lua — DO NOT EDIT (run tools/sync-lua).
 -- inspect.lua — read-only debug snapshot (SPEC §18). Registered as a no-writes
 -- function; performs NO writes, computing liveness directly so the report is accurate
 -- even with a pending sweep.

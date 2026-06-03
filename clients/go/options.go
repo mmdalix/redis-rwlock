@@ -1,6 +1,9 @@
 package rwlock
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 // Mode is the lock mode.
 type Mode string
@@ -45,6 +48,9 @@ type config struct {
 	extensionMargin      time.Duration
 	delivery             deliveryPref
 	allowIncompatibleVer bool
+	keyspaceEvents       bool
+	onRecovery           func(resource string)
+	logger               *slog.Logger
 }
 
 func defaultConfig() config {
@@ -61,6 +67,8 @@ func defaultConfig() config {
 		blockingPoolSize:   16,
 		extensionMargin:    500 * time.Millisecond,
 		delivery:           deliveryAuto,
+		keyspaceEvents:     true, // auto-detect; no-op if the server has them disabled
+		logger:             slog.New(slog.DiscardHandler),
 	}
 }
 
@@ -93,6 +101,22 @@ func WithDeliveryScripts() Option { return func(c *config) { c.delivery = delive
 
 // WithAllowIncompatibleProtocol contends even if the server's protocol version differs.
 func WithAllowIncompatibleProtocol(b bool) Option { return func(c *config) { c.allowIncompatibleVer = b } }
+
+// WithKeyspaceEvents enables (default) or disables the auto-detected keyspace-expiry
+// recovery subscriber. Never calls CONFIG SET; a no-op if the server lacks the events.
+func WithKeyspaceEvents(b bool) Option { return func(c *config) { c.keyspaceEvents = b } }
+
+// WithOnRecovery registers a callback invoked after a keyspace-expiry-triggered sweep.
+func WithOnRecovery(fn func(resource string)) Option { return func(c *config) { c.onRecovery = fn } }
+
+// WithLogger sets a structured logger (default: discard).
+func WithLogger(lg *slog.Logger) Option {
+	return func(c *config) {
+		if lg != nil {
+			c.logger = lg
+		}
+	}
+}
 
 // acquireOptions are resolved per acquire.
 type acquireOptions struct {

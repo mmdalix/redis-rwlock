@@ -1,0 +1,55 @@
+name: Go
+
+on:
+  push:
+    branches: [main]
+    paths: ["clients/go/**", "protocol/**", "tools/interop/**", ".github/workflows/go.yml"]
+  pull_request:
+    paths: ["clients/go/**", "protocol/**", "tools/interop/**", ".github/workflows/go.yml"]
+
+concurrency:
+  group: go-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: clients/go
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24.x", "1.25.x"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Install Redis
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  interop:
+    # Proves "one brain, many clients": a Go writer must exclude a Node writer on the
+    # same Redis, and the fencing counter must be shared & monotonic across languages.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Install Redis
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Install Node client deps
+        working-directory: clients/node
+        run: npm install
+      - name: Go ↔ Node interop
+        run: bash tools/interop/run.sh

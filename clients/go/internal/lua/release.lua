@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/release.lua — DO NOT EDIT (run tools/sync-lua).
 -- release.lua — free a holder, then immediately grant the next eligible waiter(s).
 --
 -- KEYS[1] = prefix

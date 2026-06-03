@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/lib.lua — DO NOT EDIT (run tools/sync-lua).
 -- lib.lua — shared helpers for all redis-rwlock scripts (PROTOCOL_VERSION 1).
 --
 -- This file is prepended to each script for the EVALSHA path and wrapped into the

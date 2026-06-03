@@ -1,4 +1,3 @@
--- GENERATED from protocol/lua/cancel_wait.lua — DO NOT EDIT (run tools/sync-lua).
 -- cancel_wait.lua — remove a timed-out/cancelled waiter; reconcile a last-instant grant.
 --
 -- KEYS[1] = prefix

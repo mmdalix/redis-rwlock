@@ -209,8 +209,8 @@ clients/go/
 | **G0** | Module + embedded Lua + delivery/handshake; raw `AcquireWrite`/`AcquireRead`/`Release`/`Extend`; blocking-pool BLPOP wait loop with `next_wake`; fencing; fail-closed; `errors.Is` taxonomy. **✅ done** |
 | **G1** | Read locks + fairness policies (write_preferring blocks/serves; read_preferring jumps) — exercised against the shared Lua. **✅ done** |
 | **G2** | `Extend` safety margin + watchdog goroutine + scoped `WithWriteLock`/`WithReadLock` (Context cancelled on loss, cause `ErrLockLost`) + generic `DoWrite`/`DoRead`. **✅ done** |
-| **G3** | Recovery (self-wake + optional keyspace subscriber) + `Inspect` + metrics/tracing interfaces + slog logger. |
-| **G4** | Conformance suite green + **mixed-language interop (Go↔Node)** + `sync-lua`/`check-sync` + `go.yml` CI + first `clients/go/v0.1.0` tag. |
+| **G3** | Recovery: keyspace-expiry subscriber + `Inspect` + slog logger + `onRecovery` hook. **✅ done** (Metrics/Tracer interfaces deferred). |
+| **G4** | Conformance suite green + **mixed-language interop (Go↔Node) proven** + `sync-lua` + `check-sync` drift guard + `go.yml` CI. **✅ done**; `clients/go/v0.1.0` tag pending (tag push). |
 
 ## Open items to confirm before/during G0
 
