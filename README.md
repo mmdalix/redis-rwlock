@@ -105,7 +105,8 @@ protocol/
   lua/             # the shared, atomic Lua scripts (the "brain")
   conformance/     # language-agnostic scenarios every client must pass
 clients/
-  node/            # the Node.js / TypeScript client
+  node/            # the Node.js / TypeScript client (published: redis-rwlock)
+  go/              # the Go client (github.com/mmdalix/redis-rwlock/clients/go)
 ```
 
 ## Documentation
