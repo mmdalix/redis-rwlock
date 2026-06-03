@@ -25,6 +25,10 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      # Trusted Publishing (OIDC, tokenless) requires a recent npm.
+      - name: Use latest npm
+        run: npm install -g npm@latest
+
       - name: Install Redis (for the test gate)
         run: sudo apt-get update && sudo apt-get install -y redis-server
 
