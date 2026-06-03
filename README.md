@@ -10,21 +10,41 @@
 > acquire**. Honest about correctness, ergonomic to use.
 
 The organizing idea: **one brain, many clients.** All lock logic lives in atomic,
-server-side Redis scripts (a Redis FUNCTION library, with an `EVALSHA` fallback);
-each language client is a thin wrapper over the user's existing Redis client. That's
-what lets a Go writer and a Python reader contend on the same resource and behave
-*identically* — the semantics live in one place, not reimplemented per language.
+server-side Redis scripts (a Redis FUNCTION library, with an `EVALSHA` fallback); each
+language client is a thin wrapper over your existing Redis client. That's what lets a
+Go writer and a Python reader contend on the same resource and behave *identically* —
+the semantics live in one place, not reimplemented per language.
 
-## Is it safe?
+```ts
+import { createClient } from "redis";
+import { RwLock } from "redis-rwlock";
 
-Like **every** Redis-based distributed lock — **including Redlock** — this is a *lease*
-(a lock with a TTL), not a linearizable lock: a holder that pauses past its lease can be
-superseded. That's [inherent to distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
-not a quirk of this project. The fix is a **fencing token** — and unlike plain Redlock,
-**every acquire here returns one** (`fencingToken`). Use it as-is for *efficiency*
-(dedupe work, reduce contention); for *correctness* (a double-grant corrupts data or
-money) enforce that token at your storage layer (reject any write with a `≤` token).
-Full treatment in [`SPEC.md`](./SPEC.md) §2 and §12.
+const rw = new RwLock(await createClient().connect());
+
+await rw.withWriteLock("order:123", { leaseMs: 30_000, watchdog: true }, async (lock) => {
+  await doWork({ signal: lock.signal });                              // aborts if the lock is lost
+  await storage.write(payload, { fencingToken: lock.fencingToken });  // enforce fencing
+});
+// acquired, auto-extended while held, released even on throw
+```
+
+```bash
+npm install redis-rwlock redis
+```
+
+## Why redis-rwlock?
+
+|  | **redis-rwlock** | Redlock | `etcd` / ZooKeeper | in-process `Mutex` |
+|---|:---:|:---:|:---:|:---:|
+| Read **and** write modes (shared readers) | ✅ | ❌ | ⚠️ build it | ✅ (RWMutex) |
+| Fair FIFO queueing, **no polling** (direct hand-off) | ✅ | ❌ (retry loops) | ✅ | ✅ |
+| **Fencing token** on every grant | ✅ | ❌ | ✅ | n/a |
+| Lease + crash recovery, **zero background infra** | ✅ | ✅ | ✅ | n/a |
+| Scoped API + watchdog + `AbortSignal` + `await using` | ✅ | ⚠️ varies | ⚠️ | ✅ |
+| Runs on your existing Redis (standalone/Sentinel/Cluster) | ✅ | ✅ | separate cluster | n/a |
+
+If you already run Redis and want a *correct-when-fenced*, ergonomic RW lock, this is
+the pragmatic choice.
 
 ## Highlights
 
@@ -40,24 +60,6 @@ Full treatment in [`SPEC.md`](./SPEC.md) §2 and §12.
   support.
 - 📈 **Observability** — `inspect()`, pluggable metrics/tracing.
 
-## Quickstart (Node.js)
-
-```bash
-npm install redis-rwlock redis
-```
-
-```ts
-import { createClient } from "redis";
-import { RwLock } from "redis-rwlock";
-
-const rw = new RwLock(await createClient().connect());
-
-await rw.withWriteLock("order:123", { leaseMs: 30_000, watchdog: true }, async (lock) => {
-  await doWork({ signal: lock.signal });                         // signal aborts if the lock is lost
-  await storage.write(payload, { fencingToken: lock.fencingToken }); // enforce fencing
-});
-```
-
 Full Node docs and API: **[`clients/node`](./clients/node) / [npm](https://www.npmjs.com/package/redis-rwlock)**.
 
 ## Packages
@@ -70,6 +72,27 @@ Full Node docs and API: **[`clients/node`](./clients/node) / [npm](https://www.n
 
 The Lua protocol and conformance scenarios in [`protocol/`](./protocol) are the shared
 source of truth every client port runs against.
+
+## How it works
+
+Every transition — *can this caller acquire now; who is next when a holder releases;
+clean up anything expired* — runs inside a **single atomic Redis script**, so there are
+no client-side read-modify-write races. Waiters block on a private `BLPOP` mailbox and
+the releaser pushes the grant straight into it (no polling). State is **derived from
+source-of-truth keys** (a `readers` ZSET + a TTL'd `writer` key), so it can't drift, and
+a crashed writer's key self-expires to free the lock natively. Leases are the deadlock
+backstop; fencing tokens are the correctness backstop. See [`SPEC.md`](./SPEC.md).
+
+## Is it safe?
+
+Like **every** Redis-based distributed lock — **including Redlock** — this is a *lease*
+(a lock with a TTL), not a linearizable lock: a holder that pauses past its lease can be
+superseded. That's [inherent to distributed locking](https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html),
+not a quirk of this project. The fix is a **fencing token** — and unlike plain Redlock,
+**every acquire here returns one** (`fencingToken`). Use it as-is for *efficiency*
+(dedupe work, reduce contention); for *correctness* (a double-grant corrupts data or
+money) enforce that token at your storage layer (reject any write with a `≤` token).
+Full treatment in [`SPEC.md`](./SPEC.md) §2 and §12.
 
 ## Repository layout
 
@@ -84,16 +107,6 @@ protocol/
 clients/
   node/            # the Node.js / TypeScript client
 ```
-
-## How it works
-
-Every transition — *can this caller acquire now; who is next when a holder releases;
-clean up anything expired* — runs inside a **single atomic Redis script**, so there are
-no client-side read-modify-write races. Waiters block on a private `BLPOP` mailbox and
-the releaser pushes the grant straight into it (no polling). State is **derived from
-source-of-truth keys** (a `readers` ZSET + a TTL'd `writer` key), so it can't drift, and
-a crashed writer's key self-expires to free the lock natively. Leases are the
-deadlock backstop; fencing tokens are the correctness backstop. See [`SPEC.md`](./SPEC.md).
 
 ## Documentation
 
